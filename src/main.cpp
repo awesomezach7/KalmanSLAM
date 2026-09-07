@@ -91,10 +91,10 @@ double pdist[64];
 #define filter_distance 0.4
 #define min_matches 30
 #define VELOCITY_FILTER_RATIO 0.1
-#define reflectance_percent_to_meters 0.01 // 10% is the maximum difference in reflectivity to be paired
-#define radians_to_meters 0
-#define position_to_meters 0
-#define DAMPEN_MOTION false
+#define reflectance_percent_to_meters 0.02 // 20% is the maximum difference in reflectivity to be paired
+#define radians_to_meters 2
+#define position_to_meters 0.05
+#define DAMPEN_MOTION true
 #define USE_ICP true
 #define USE_ACCELEROMETER false
 #define SEND_INTERMEDIATE_CLOUDS false
