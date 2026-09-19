@@ -1,9 +1,6 @@
 #include <nanoflann.hpp>
 #include <Arduino.h>
 #include <vector>
-#include <iostream>
-#include <ctime>
-#include <cstdlib>
 #include <ArduinoEigen.h>
 
 #include <LSM6DSO32Sensor.h>
@@ -44,10 +41,6 @@ unsigned long startTime = micros();
 bool firstLoop = true;
 unsigned long endTime = micros();
 double elapsedTime = endTime - startTime;
-unsigned long startTimeICP = micros();
-bool firstLoopICP = true;
-unsigned long endTimeICP = micros();
-double elapsedTimeICP = endTimeICP - startTimeICP;
 
 #include <SparkFun_VL53L5CX_Library.h> //http://librarymanager/All#SparkFun_VL53L5CX
 #include <Wire.h>
@@ -83,20 +76,22 @@ double ST_YAW_ANGLES_DEG[64] = {
 
 double pdist[64];
 
-//TWEAKABLE VALUES
+//Sensor Tweaks
 #define ToF_Sharpness 20
+#define GyroFullScale 500
+#define AccFullScale 8
 #define microsteps 15
+#define USE_ACCELEROMETER false
+
+//Alignment Tweaks
 #define max_leaf 12
 #define ICP_Iterations 3
 #define filter_distance 0.4
 #define min_matches 30
 #define VELOCITY_FILTER_RATIO 0.1
-#define reflectance_percent_to_meters 0.02 // 20% is the maximum difference in reflectivity to be paired
 #define radians_to_meters 2
 #define position_to_meters 0.05
-#define DAMPEN_MOTION true
 #define USE_ICP true
-#define USE_ACCELEROMETER false
 #define SEND_INTERMEDIATE_CLOUDS false
 
 const double accoffset[3] = {36.8,-2.87,-36.5};
@@ -112,7 +107,7 @@ struct PointCloud
 {
     struct Point
     {
-        T x, y, z, r;
+        T x, y, z;
     };
 
     using coord_t = T;  //!< The type of each coordinate
@@ -134,8 +129,6 @@ struct PointCloud
             return pts[idx].y;
         else if (dim == 2)
             return pts[idx].z;
-        else
-            return pts[idx].r;
     }
 
     // Optional bounding-box computation: return false to default to a standard
@@ -178,10 +171,10 @@ static void I2CIntegrator(void * pvParameters) {
     // Read accelerometer and gyroscope.
     int32_t acc[3];
     int32_t gyro[3];
-    double accelerometer[3];
-    double gyroscope[3];
     AccGyr.Get_X_Axes(acc);
     AccGyr.Get_G_Axes(gyro);
+    double accelerometer[3];
+    double gyroscope[3];
     //Subtract Sample sums
     for(int i = 0; i < 3; i++) {
       //Changing to better type
@@ -234,7 +227,7 @@ static void I2CIntegrator(void * pvParameters) {
   }
 }
 
-static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::Vector3f, 64>& newCloud, std::array<float, 64>& reflect, std::array<boolean, 64>& hasData) {
+static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::Vector3f, 64>& newCloud, std::array<boolean, 64>& hasData) {
   //The ST library returns the data transposed from zone mapping shown in datasheet
   //Pretty-print data with increasing y, decreasing x to reflect reality
   xSemaphoreTake(distDataMutex, portMAX_DELAY);
@@ -242,7 +235,7 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
   {
     for (int x = imageWidth - 1 ; x >= 0 ; x--)
     {
-      double dist = distData.distance_mm[x + y]/1000.0;
+      double dist = distData.distance_mm[x + y]/1000.0; //Converted to meters
       if (pdist[x+y] != dist && dist != 0){ //Some extra complexity is added to ignore instances where the sensor does not give a new distance and reports the previous distance
         // === ST Lookup Table Method ===
         // Compute sin/cos for ST-calibrated pitch/yaw angles
@@ -260,7 +253,6 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
         Eigen::Vector3f point_prime = (Orientation * point).cast<float>();
         newCloud[x+y] = {point_prime.x() + float(position[0]), point_prime.y() + float(position[1]), point_prime.z() + float(position[2])}; //Quaternion + position
         xSemaphoreGive(inertialDataMutex);
-        reflect[x+y] = float(distData.reflectance[x+y] * reflectance_percent_to_meters); // Max 255, normal max 100 as a percentage of reflected light.
         pdist[x+y] = dist;
         hasData[x+y] = true;
       } else {
@@ -278,9 +270,8 @@ static void runICP(void * pvParameters){
     // Distance Sensor Output (Populating newCloud)
     if (xSemaphoreTake(xCoreSyncSemaphore, portMAX_DELAY) == pdTRUE){ //distData is read by the other core so only 1 core accesses I2C
       std::array<Eigen::Vector3f, 64> newCloud;
-      std::array<float, 64> reflect;
       std::array<boolean, 64> hasData;
-      interpretDistances(distData, newCloud, reflect, hasData);
+      interpretDistances(distData, newCloud, hasData);
       //ICP
       if (!cloud.pts.empty()){
         for (int i = 0; i < ICP_Iterations; i++){
@@ -293,19 +284,18 @@ static void runICP(void * pvParameters){
             }
             serial_write(pointMsg);//TODO: Sending data takes 5ms, that is a problem! I think I need to send the data as a binary.
           }
-          Eigen::MatrixXd A = Eigen::MatrixXd::Zero(70, 6);
-          Eigen::VectorXd b = Eigen::VectorXd::Zero(70);
+          Eigen::MatrixXd A = Eigen::MatrixXd::Zero(64, 6);
+          Eigen::VectorXd b = Eigen::VectorXd::Zero(64);
           int n = 0;
           for (int point = 0; point < 64; point++){ //Iterate over every point
             if (hasData[point]) {
-              //HERE IS WHERE TO FIND COMPUTE CYCLE OPTIMIZATIONS
               //Search kd tree to find closest point
               const size_t num_results = 3;
               nanoflann::KNNResultSet<float> resultSet(num_results);
               size_t ret_index[num_results];
               float out_dist_sqr[num_results]; //Square of distance
               resultSet.init(ret_index, out_dist_sqr);
-              float query_pt[4] = {newCloud[point][0], newCloud[point][1], newCloud[point][2], reflect[point]};
+              float query_pt[3] = {newCloud[point][0], newCloud[point][1], newCloud[point][2]};
               tree_index.findNeighbors(resultSet, query_pt, {});
 
               if (out_dist_sqr[2] <= filter_distance*filter_distance) { // For filtering, the closest point needs to be relatively close
@@ -331,25 +321,6 @@ static void runICP(void * pvParameters){
               }
             }
           }
-          if (DAMPEN_MOTION) {
-            std::array<Eigen::VectorXd, 6> final_rows;
-            final_rows[0].resize(6);
-            final_rows[0] << radians_to_meters, 0, 0, 0, 0, 0;
-            final_rows[1].resize(6);
-            final_rows[1] << 0, radians_to_meters, 0, 0, 0, 0;
-            final_rows[2].resize(6);
-            final_rows[2] << 0, 0, radians_to_meters, 0, 0, 0;
-            final_rows[3].resize(6);
-            final_rows[3] << 0, 0, 0, position_to_meters, 0, 0;
-            final_rows[4].resize(6);
-            final_rows[4] << 0, 0, 0, 0, position_to_meters, 0;
-            final_rows[5].resize(6);
-            final_rows[5] << 0, 0, 0, 0, 0, position_to_meters;
-            for (int i = 0; i < 6; i++) {
-              A.row(n + i) = final_rows[i];
-              b(n + i) = 0;
-            }
-          }
           serial_write("All points processed for iteration: " + String(i + 1) + ", and there were " + String(n) + " good points");
           Eigen::Matrix4d transform_opt;
           if (A.rows() == 0 || A.cols() == 0 || !A.allFinite() || A.cwiseAbs().maxCoeff() == 0.0 || n < min_matches || !USE_ICP){
@@ -360,38 +331,17 @@ static void runICP(void * pvParameters){
             transform_opt << 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1;
           } else {
             //Free extra size of MatrixXd based on final value of n
-            if (DAMPEN_MOTION) {
-              A.conservativeResize(n + 6, 6);
-              b.conservativeResize(n + 6);
-            } else {
-              A.conservativeResize(n, 6);
-              b.conservativeResize(n);
-            }
+            A.conservativeResize(n, 6);
+            b.conservativeResize(n);
             Eigen::VectorXd x_opt = Eigen::pseudoInverse(A)*b;
             //Turn x_opt into the 4x4 matrix transform it optimized for
             transform_opt << 1, -x_opt(2), x_opt(1), x_opt(3), x_opt(2), 1, -x_opt(0), x_opt(4), -x_opt(1), x_opt(0), 1, x_opt(5), 0, 0, 0, 1;
           }
           Eigen::Quaterniond transform_quat(transform_opt.topLeftCorner<3,3>());
           Eigen::Transform<double, 3, Eigen::Affine> transform(transform_opt); //Can be applied directly to 3d vectors now
-
-          //Rather than applying the euler angles, this allows us to only apply the transformation that was optimized for, not what it pretends to be
-          //Apply optimal transformation to sensor quaternion
           xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
           Orientation *= transform_quat;
-          //Apply optimal transformation to sensor position (same as pointcloud)
-          Eigen::Vector3d delta = transform * position - position;
           position = transform * position;
-          //Update velocity (drag towards new value at 1/2 ratio)
-          if (firstLoopICP) {
-            firstLoopICP = false;
-            elapsedTimeICP = 2; //Set to 2 seconds if unknown, effectively a higher filter ratio
-            startTimeICP = micros();
-          } else {
-            endTimeICP = micros();
-            elapsedTimeICP = double(endTimeICP - startTimeICP)/1000000.0; //seconds
-            startTimeICP = micros();
-          }
-          velocity += delta * VELOCITY_FILTER_RATIO/elapsedTimeICP;
           xSemaphoreGive(inertialDataMutex);
           //Apply optimal transformation to newCloud
           for(int point = 0; point < 64; point++) {
@@ -408,7 +358,7 @@ static void runICP(void * pvParameters){
       for(int point = 0; point < 64; point++) {
         if (hasData[point]) {
           //Add point to cloud
-          cloud.pts.push_back({newCloud[point][0], newCloud[point][1], newCloud[point][2], reflect[point]});
+          cloud.pts.push_back({newCloud[point][0], newCloud[point][1], newCloud[point][2]});
           //Send point data
           pointMsg += "," + String(newCloud[point][0]) + "," + String(newCloud[point][1]) + "," + String(newCloud[point][2]);
         }
@@ -418,7 +368,6 @@ static void runICP(void * pvParameters){
       //Add new points to index
       //This is the only O(n) part because tree is reformed after each chunk, luckily only done 15Hz not 15*64Hz
       tree_index.addPoints(old_size, new_size - 1);
-      //TODO: Loop Closure/RANSAC?
       dump_mem_usage();
     }
   }
@@ -433,13 +382,13 @@ void setup()
   for (int i = 0; i < 64; i++) {
     pdist[i] = 0.0;
   }
-  delay(20);
+  delay(5);
   // Led.
   pinMode(LED_BUILTIN, OUTPUT);
 
   // Initialize serial for output.
   SerialPort.begin(115200);
-  delay(300);
+  delay(50);
   while (!SerialPort) {
     delay(10);
   }
@@ -450,8 +399,8 @@ void setup()
   AccGyr.begin();
   AccGyr.Enable_X();
   AccGyr.Enable_G();
-  AccGyr.Set_G_FS(500);
-  AccGyr.Set_X_FS(8);
+  AccGyr.Set_G_FS(GyroFullScale);
+  AccGyr.Set_X_FS(AccFullScale);
   delay(20);
 
   Wire.begin(); //This resets to 100kHz I2C
