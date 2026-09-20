@@ -3,22 +3,21 @@
 #include <vector>
 #include <ArduinoEigen.h>
 
-#include <LSM6DSO32Sensor.h>
-
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
 #include "queue.h"
 
-#ifdef ARDUINO_SAM_DUE
-  #define DEV_I2C Wire1
-#else
-  #define DEV_I2C Wire
-#endif
+static SemaphoreHandle_t xCoreSyncSemaphore;
+static SemaphoreHandle_t distDataMutex;
+static SemaphoreHandle_t inertialDataMutex;
 
+#include <LSM6DSO32Sensor.h>
+
+#define IMU_I2C Wire
 // Components
-LSM6DSO32Sensor AccGyr(&DEV_I2C);
-
+LSM6DSO32Sensor AccGyr(&IMU_I2C);
+//elapsedTime init for integration
 unsigned long startTime = micros();
 bool firstLoop = true;
 unsigned long endTime = micros();
@@ -27,12 +26,9 @@ double elapsedTime = endTime - startTime;
 #include <SparkFun_VL53L5CX_Library.h> //http://librarymanager/All#SparkFun_VL53L5CX
 #include <Wire.h>
 SparkFun_VL53L5CX ToF;
-VL53L5CX_ResultsData distData; // Result data class structure, 1356 byes of RAM
-static SemaphoreHandle_t xCoreSyncSemaphore;
-static SemaphoreHandle_t distDataMutex;
-static SemaphoreHandle_t inertialDataMutex;
+VL53L5CX_ResultsData distData; // Result data class structure
 
-int imageWidth = 0; //Used to pretty print output
+int imageWidth; //Used to pretty print output
 
 // ST_ANGLES to interpret distances
 double ST_PITCH_ANGLES_DEG[64] = {
@@ -56,7 +52,7 @@ double ST_YAW_ANGLES_DEG[64] = {
     225.00, 234.60, 246.80, 261.87, 278.13, 293.20, 305.40, 315.00,
 };
 
-double pdist[64];
+double pdist[64] = {};
 
 //Sensor Tweaks
 #define ToF_Sharpness 20
@@ -70,7 +66,7 @@ double pdist[64];
 #define alignment_iterations 2
 #define filter_distance 0.4
 #define min_matches 30
-#define USE_ICP true
+#define DO_ALIGN false
 #define SEND_INTERMEDIATE_CLOUDS false
 
 const Eigen::Vector3d accoffset = {36.8,-2.87,-36.5};
@@ -80,8 +76,8 @@ const Eigen::Vector3d gyrooffset = {-342.2, 448.3, 790.0};
 Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
 Eigen::Vector3d velocity(0.0, 0.0, 0.0);
 Eigen::Vector3d position(0.0, 0.0, 0.0);
-#include <utils.h>
 
+#include <utils.h>
 PointCloud<float> cloud;
 using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
         nanoflann::L2_Simple_Adaptor<float, PointCloud<float>>, PointCloud<float>, 3 /* dim */
@@ -133,13 +129,14 @@ static void I2CIntegrator(void * pvParameters) {
       // Read accelerometer
       int32_t acc[3];
       AccGyr.Get_X_Axes(acc);
-      //Sensor Reference Frame
+      //SENSOR Reference Frame
       Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accoffset) * 9.8/1000;
-      //Global Reference Frame
+      //GLOBAL Reference Frame
       Eigen::Vector3d trueAccel(Orientation * accelerometer);
+      //Subtract Gravity
       trueAccel[2] -= 9.8;
       xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
-      //Double integration step (Not messing with trapezoids, alignment does not need incredible precision)
+      //Double integration step
       velocity += trueAccel * elapsedTime;
       position += velocity * elapsedTime;
       xSemaphoreGive(inertialDataMutex);
@@ -179,7 +176,7 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
         // Negate X to match our lens-flip convention
         double st_ray_dir_x = -std::cos(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         double st_ray_dir_y = std::sin(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
-        //Point in Sensor's reference frame:
+        //Point in SENSOR reference frame:
         Eigen::Vector3d point = {st_ray_dir_y * dist, st_ray_dir_x * dist, dist};
         //Point in GLOBAL reference frame:
         xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
@@ -196,7 +193,7 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
   xSemaphoreGive(distDataMutex);
 }
 
-static void runICP(void * pvParameters){
+static void aligner(void * pvParameters){
   for(;;){
     vTaskDelay(1);//for watchdog
     // SLAM: Core 0
@@ -205,7 +202,7 @@ static void runICP(void * pvParameters){
       std::array<Eigen::Vector3f, 64> newCloud;
       std::array<boolean, 64> hasData;
       interpretDistances(distData, newCloud, hasData);
-      //ICP
+      //Alignment
       if (!cloud.pts.empty()) {
         for (int i = 0; i < alignment_iterations; i++) {
           if (SEND_INTERMEDIATE_CLOUDS) {
@@ -230,7 +227,6 @@ static void runICP(void * pvParameters){
               resultSet.init(ret_index, out_dist_sqr);
               float query_pt[3] = {newCloud[point][0], newCloud[point][1], newCloud[point][2]};
               tree_index.findNeighbors(resultSet, query_pt, {});
-
               if (out_dist_sqr[2] <= filter_distance*filter_distance) { // For filtering, the closest point needs to be relatively close
                 n++;
                 //Normal vector is cross product of two vectors between points on the plane
@@ -256,9 +252,9 @@ static void runICP(void * pvParameters){
           }
           serial_write("All points processed for iteration: " + String(i + 1) + ", and there were " + String(n) + " good points");
           Eigen::Matrix4d transform_opt;
-          if (A.rows() == 0 || A.cols() == 0 || !A.allFinite() || A.cwiseAbs().maxCoeff() == 0.0 || n < min_matches || !USE_ICP) {
+          if (A.rows() == 0 || A.cols() == 0 || !A.allFinite() || A.cwiseAbs().maxCoeff() == 0.0 || n < min_matches || !DO_ALIGN) {
             //Revert to using identity matrix
-            if (USE_ICP) {
+            if (DO_ALIGN) {
               serial_write("bad or not enough data for cloud alignment");
             }
             transform_opt << 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1;
@@ -284,7 +280,7 @@ static void runICP(void * pvParameters){
           }
         }
       }
-      //All ICP iterations completed, newCloud now has points that line up with previous points (Or nothing happened if cloud.pts.empty())
+      //All iterations completed, newCloud now has points that line up with previous points (Or nothing happened if cloud.pts.empty())
       //Update Kd Tree
       size_t old_size = cloud.kdtree_get_point_count();
       String pointMsg = "NewPts";
@@ -312,9 +308,6 @@ TaskHandle_t SerialLog;
 
 void setup()
 {
-  for (int i = 0; i < 64; i++) {
-    pdist[i] = 0.0;
-  }
   delay(5);
   // Led.
   pinMode(LED_BUILTIN, OUTPUT);
@@ -328,7 +321,7 @@ void setup()
   SerialPort.write("Setting up...");
 
   // Initialize I2C bus.
-  DEV_I2C.begin();
+  IMU_I2C.begin();
   AccGyr.begin();
   AccGyr.Enable_X();
   AccGyr.Enable_G();
@@ -354,7 +347,7 @@ void setup()
   distDataMutex = xSemaphoreCreateMutex();
   inertialDataMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(
-    runICP,
+    aligner,
     "Core0Task",
     32768,
     NULL,
