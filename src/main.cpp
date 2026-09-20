@@ -80,56 +80,7 @@ const Eigen::Vector3d gyrooffset = {-342.2, 448.3, 790.0};
 Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
 Eigen::Vector3d velocity(0.0, 0.0, 0.0);
 Eigen::Vector3d position(0.0, 0.0, 0.0);
-//From utils.h, gives definition of PointCloud that can be used to initialize a kd tree
-template <typename T>
-struct PointCloud
-{
-    struct Point
-    {
-        T x, y, z;
-    };
-
-    using coord_t = T;  //!< The type of each coordinate
-
-    std::vector<Point> pts;
-
-    // Must return the number of data points
-    inline size_t kdtree_get_point_count() const { return pts.size(); }
-
-    // Returns the dim'th component of the idx'th point in the class:
-    // Since this is inlined and the "dim" argument is typically an immediate
-    // value, the
-    //  "if/else's" are actually solved at compile time.
-    inline T kdtree_get_pt(const size_t idx, const size_t dim) const
-    {
-        if (dim == 0)
-            return pts[idx].x;
-        else if (dim == 1)
-            return pts[idx].y;
-        else if (dim == 2)
-            return pts[idx].z;
-    }
-
-    // Optional bounding-box computation: return false to default to a standard
-    // bbox computation loop.
-    //   Return true if the BBOX was already computed by the class and returned
-    //   in "bb" so it can be avoided to redo it again. Look at bb.size() to
-    //   find out the expected dimensionality (e.g. 2 or 3 for point clouds)
-    template <class BBOX>
-    bool kdtree_get_bbox(BBOX& /* bb */) const
-    {
-        return false;
-    }
-};
-inline void dump_mem_usage() {
-    FILE* f = fopen("/proc/self/statm", "rt");
-    if (!f) return;
-    char   str[300];
-    size_t n = fread(str, 1, 200, f);
-    str[n]   = 0;
-    printf("MEM: %s\n", str);
-    fclose(f);
-}
+#include <utils.h>
 
 PointCloud<float> cloud;
 using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
