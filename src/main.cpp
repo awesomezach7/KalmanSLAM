@@ -15,24 +15,6 @@
 #else
   #define DEV_I2C Wire
 #endif
-#define SerialPort Serial
-static QueueHandle_t serial_queue;
-static void serial_write(const String msg) {
-  char * msgCopy = strdup(msg.c_str());
-  if (msgCopy == NULL) {return;}
-  if (xQueueSend(serial_queue, &msgCopy, 0) != pdPASS) {
-    free(msgCopy);
-  }
-}
-
-static void SerialLogger(void * pvParameters) {
-  char *msg;
-  for (;;) {
-    xQueueReceive(serial_queue, &msg, portMAX_DELAY);
-    SerialPort.println(msg);
-    free(msg);
-  }
-}
 
 // Components
 LSM6DSO32Sensor AccGyr(&DEV_I2C);
@@ -85,17 +67,14 @@ double pdist[64];
 
 //Alignment Tweaks
 #define max_leaf 12
-#define ICP_Iterations 3
+#define alignment_iterations 2
 #define filter_distance 0.4
 #define min_matches 30
-#define VELOCITY_FILTER_RATIO 0.1
-#define radians_to_meters 2
-#define position_to_meters 0.05
 #define USE_ICP true
 #define SEND_INTERMEDIATE_CLOUDS false
 
-const double accoffset[3] = {36.8,-2.87,-36.5};
-const double gyrooffset[3] = {-342.2, 448.3, 790.0};
+const Eigen::Vector3d accoffset = {36.8,-2.87,-36.5};
+const Eigen::Vector3d gyrooffset = {-342.2, 448.3, 790.0};
 //Note that the type used for the point cloud is also tweakable (may use half_float for less memory usage)
 
 Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
@@ -154,36 +133,39 @@ inline void dump_mem_usage() {
 
 PointCloud<float> cloud;
 using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
-        nanoflann::L2_Simple_Adaptor<float, PointCloud<float>>, PointCloud<float>, 4 /* dim */
+        nanoflann::L2_Simple_Adaptor<float, PointCloud<float>>, PointCloud<float>, 3 /* dim */
         >;
 my_kd_tree_t tree_index(4, cloud, max_leaf);
 // Cannot call functions at top level to add points
 
+#define SerialPort Serial
+static QueueHandle_t serial_queue;
+static void serial_write(const String msg) {
+  char * msgCopy = strdup(msg.c_str());
+  if (msgCopy == NULL) {return;}
+  if (xQueueSend(serial_queue, &msgCopy, 0) != pdPASS) {
+    free(msgCopy);
+  }
+}
+static void SerialLogger(void * pvParameters) {
+  char *msg;
+  for (;;) {
+    xQueueReceive(serial_queue, &msg, portMAX_DELAY);
+    SerialPort.println(msg);
+    free(msg);
+  }
+}
+
 static void I2CIntegrator(void * pvParameters) {
+  //IO Core
   for(;;) {
     vTaskDelay(1);
-    //IO Core
-    if ((millis() / 1000) % 2 == 0) {
-      digitalWrite(LED_BUILTIN, HIGH);
-    } else {
-      digitalWrite(LED_BUILTIN, LOW);
-    }
-    // Read accelerometer and gyroscope.
-    int32_t acc[3];
+    //Blink LED
+    digitalWrite(LED_BUILTIN, (millis() / 1000) % 2);
+    // Read gyroscope.
     int32_t gyro[3];
-    AccGyr.Get_X_Axes(acc);
     AccGyr.Get_G_Axes(gyro);
-    double accelerometer[3];
-    double gyroscope[3];
-    //Subtract Sample sums
-    for(int i = 0; i < 3; i++) {
-      //Changing to better type
-      accelerometer[i] = acc[i];
-      gyroscope[i] = gyro[i];
-      //Calibration Offset
-      accelerometer[i] += accoffset[i];
-      gyroscope[i] += gyrooffset[i];
-    }
+    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>() + gyrooffset;
     if (firstLoop) {firstLoop = false; startTime = micros();}
     endTime = micros();
     elapsedTime = double(endTime - startTime)/1000000.0; //seconds
@@ -196,19 +178,21 @@ static void I2CIntegrator(void * pvParameters) {
     }
     Orientation.normalize();
     xSemaphoreGive(inertialDataMutex);
-    Eigen::Vector3d trueAccel(Orientation * Eigen::Vector3d(accelerometer[0], accelerometer[1], accelerometer[2]));
-    //From milliGs to m/s^2
-    trueAccel *= 9.8/1000;
-    trueAccel[2] -= 9.8;
-    xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
     if (USE_ACCELEROMETER) {
-      for(int i = 0; i < 3; i++) {
-        //Double integration step (Not messing with trapezoids, ICP should fix anyways)
-        velocity[i] += trueAccel[i] * elapsedTime;
-        position[i] += velocity[i] * elapsedTime;
-      }
+      // Read accelerometer
+      int32_t acc[3];
+      AccGyr.Get_X_Axes(acc);
+      //Sensor Reference Frame
+      Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accoffset) * 9.8/1000;
+      //Global Reference Frame
+      Eigen::Vector3d trueAccel(Orientation * accelerometer);
+      trueAccel[2] -= 9.8;
+      xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
+      //Double integration step (Not messing with trapezoids, alignment does not need incredible precision)
+      velocity += trueAccel * elapsedTime;
+      position += velocity * elapsedTime;
+      xSemaphoreGive(inertialDataMutex);
     }
-    xSemaphoreGive(inertialDataMutex);
     vTaskDelay(1);
     // Output data.
     String orientationEstimate = "Orient, "+String(Orientation.w())+", "+String(Orientation.x())+", "+String(Orientation.y())+", "+String(Orientation.z());
@@ -231,10 +215,8 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
   //The ST library returns the data transposed from zone mapping shown in datasheet
   //Pretty-print data with increasing y, decreasing x to reflect reality
   xSemaphoreTake(distDataMutex, portMAX_DELAY);
-  for (int y = 0 ; y <= imageWidth * (imageWidth - 1) ; y += imageWidth)
-  {
-    for (int x = imageWidth - 1 ; x >= 0 ; x--)
-    {
+  for (int y = 0 ; y <= imageWidth * (imageWidth - 1) ; y += imageWidth) {
+    for (int x = imageWidth - 1 ; x >= 0 ; x--) {
       double dist = distData.distance_mm[x + y]/1000.0; //Converted to meters
       if (pdist[x+y] != dist && dist != 0){ //Some extra complexity is added to ignore instances where the sensor does not give a new distance and reports the previous distance
         // === ST Lookup Table Method ===
@@ -247,7 +229,7 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
         double st_ray_dir_x = -std::cos(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         double st_ray_dir_y = std::sin(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         //Point in Sensor's reference frame:
-        Eigen::Vector3d point = {st_ray_dir_y * dist, st_ray_dir_x * dist, dist}; // divide by 1000 to convert mm to meters
+        Eigen::Vector3d point = {st_ray_dir_y * dist, st_ray_dir_x * dist, dist};
         //Point in GLOBAL reference frame:
         xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
         Eigen::Vector3f point_prime = (Orientation * point).cast<float>();
@@ -268,13 +250,13 @@ static void runICP(void * pvParameters){
     vTaskDelay(1);//for watchdog
     // SLAM: Core 0
     // Distance Sensor Output (Populating newCloud)
-    if (xSemaphoreTake(xCoreSyncSemaphore, portMAX_DELAY) == pdTRUE){ //distData is read by the other core so only 1 core accesses I2C
+    if (xSemaphoreTake(xCoreSyncSemaphore, portMAX_DELAY) == pdTRUE) { //distData is read by the other core so only 1 core accesses I2C
       std::array<Eigen::Vector3f, 64> newCloud;
       std::array<boolean, 64> hasData;
       interpretDistances(distData, newCloud, hasData);
       //ICP
-      if (!cloud.pts.empty()){
-        for (int i = 0; i < ICP_Iterations; i++){
+      if (!cloud.pts.empty()) {
+        for (int i = 0; i < alignment_iterations; i++) {
           if (SEND_INTERMEDIATE_CLOUDS) {
             String pointMsg = "OldPts";
             for(int point = 0; point < 64; point++) {
@@ -287,7 +269,7 @@ static void runICP(void * pvParameters){
           Eigen::MatrixXd A = Eigen::MatrixXd::Zero(64, 6);
           Eigen::VectorXd b = Eigen::VectorXd::Zero(64);
           int n = 0;
-          for (int point = 0; point < 64; point++){ //Iterate over every point
+          for (int point = 0; point < 64; point++) { //Iterate over every point
             if (hasData[point]) {
               //Search kd tree to find closest point
               const size_t num_results = 3;
@@ -323,7 +305,7 @@ static void runICP(void * pvParameters){
           }
           serial_write("All points processed for iteration: " + String(i + 1) + ", and there were " + String(n) + " good points");
           Eigen::Matrix4d transform_opt;
-          if (A.rows() == 0 || A.cols() == 0 || !A.allFinite() || A.cwiseAbs().maxCoeff() == 0.0 || n < min_matches || !USE_ICP){
+          if (A.rows() == 0 || A.cols() == 0 || !A.allFinite() || A.cwiseAbs().maxCoeff() == 0.0 || n < min_matches || !USE_ICP) {
             //Revert to using identity matrix
             if (USE_ICP) {
               serial_write("bad or not enough data for cloud alignment");
