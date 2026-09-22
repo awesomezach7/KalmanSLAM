@@ -82,24 +82,42 @@ PointCloud<float> cloud;
 using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
         nanoflann::L2_Simple_Adaptor<float, PointCloud<float>>, PointCloud<float>, 3 /* dim */
         >;
-my_kd_tree_t tree_index(4, cloud, max_leaf);
+my_kd_tree_t tree_index(3, cloud, max_leaf);
 // Cannot call functions at top level to add points
 
 #define SerialPort Serial
-static QueueHandle_t serial_queue;
-static void serial_write(const String msg) {
+static QueueHandle_t string_queue;
+static QueueHandle_t data_queue;
+static void serial_write(const String msg, std::vector<float> data = {}) {
   char * msgCopy = strdup(msg.c_str());
+  std::vector<float> * dataCopy = new std::vector<float>(data);
   if (msgCopy == NULL) {return;}
-  if (xQueueSend(serial_queue, &msgCopy, 0) != pdPASS) {
+  if (xQueueSend(string_queue, &msgCopy, 0) != pdPASS || xQueueSend(data_queue, &dataCopy, 0) != pdPASS) {
     free(msgCopy);
+    delete dataCopy;
   }
 }
+void float2Bytes(byte bytes_temp[4],float float_variable) { 
+  memcpy(bytes_temp, (unsigned char*) (&float_variable), 4);
+}
 static void SerialLogger(void * pvParameters) {
-  char *msg;
+  char * msg;
+  std::vector<float> * data;
   for (;;) {
-    xQueueReceive(serial_queue, &msg, portMAX_DELAY);
-    SerialPort.println(msg);
+    xQueueReceive(string_queue, &msg, portMAX_DELAY);
+    xQueueReceive(data_queue, &data, portMAX_DELAY);
+    std::vector<float> realdata = data[0];
+    SerialPort.print(msg);
+    for (const auto& val : realdata) {
+      byte bytes[4];
+      float2Bytes(bytes, val);
+      for (int i = 0; i < 4; i++) {
+        SerialPort.write(bytes[i]);
+      }
+    }
+    SerialPort.println();
     free(msg);
+    delete data;
   }
 }
 
@@ -143,11 +161,13 @@ static void I2CIntegrator(void * pvParameters) {
     }
     vTaskDelay(1);
     // Output data.
-    String orientationEstimate = "Orient, "+String(Orientation.w())+", "+String(Orientation.x())+", "+String(Orientation.y())+", "+String(Orientation.z());
-    String positionEstimate = "Pos, "+String(position[0])+", "+String(position[1])+", "+String(position[2]);
-    String velocityEstimate = "Vel, "+String(velocity[0])+", "+String(velocity[1])+", "+String(velocity[2]);
-    String inertialUpdate = orientationEstimate + ", " + positionEstimate + ", " + velocityEstimate + ", Time = " + String(elapsedTime * 1000) + " ms";
-    serial_write(inertialUpdate);
+    std::vector<float> inertialUpdateData = {
+      static_cast<float>(Orientation.w()), static_cast<float>(Orientation.x()), static_cast<float>(Orientation.y()), static_cast<float>(Orientation.z()),
+      static_cast<float>(position[0]), static_cast<float>(position[1]), static_cast<float>(position[2]),
+      static_cast<float>(velocity[0]), static_cast<float>(velocity[1]), static_cast<float>(velocity[2]),
+      static_cast<float>(elapsedTime * 1000)
+    };
+    serial_write("inertialUpdate: ", inertialUpdateData);
     if (ToF.isDataReady()) {
       xSemaphoreTake(distDataMutex, portMAX_DELAY);
       if (ToF.getRangingData(&distData)){
@@ -206,13 +226,15 @@ static void aligner(void * pvParameters){
       if (!cloud.pts.empty()) {
         for (int i = 0; i < alignment_iterations; i++) {
           if (SEND_INTERMEDIATE_CLOUDS) {
-            String pointMsg = "OldPts";
+            std::vector<float> intermediateCloudData;
             for(int point = 0; point < 64; point++) {
               if (hasData[point]) {
-                pointMsg += "," + String(newCloud[point][0]) + "," + String(newCloud[point][1]) + "," + String(newCloud[point][2]);
+                for (int i = 0; i < 3; i++) {
+                  intermediateCloudData.push_back(newCloud[point][i]);
+                }
               }
             }
-            serial_write(pointMsg);//TODO: Sending data takes 5ms, that is a problem! I think I need to send the data as a binary.
+            serial_write("intermediatePts: ", intermediateCloudData);
           }
           Eigen::MatrixXd A = Eigen::MatrixXd::Zero(64, 6);
           Eigen::VectorXd b = Eigen::VectorXd::Zero(64);
@@ -283,16 +305,16 @@ static void aligner(void * pvParameters){
       //All iterations completed, newCloud now has points that line up with previous points (Or nothing happened if cloud.pts.empty())
       //Update Kd Tree
       size_t old_size = cloud.kdtree_get_point_count();
-      String pointMsg = "NewPts";
+      std::vector<float> newCloudData;
       for(int point = 0; point < 64; point++) {
         if (hasData[point]) {
-          //Add point to cloud
           cloud.pts.push_back({newCloud[point][0], newCloud[point][1], newCloud[point][2]});
-          //Send point data
-          pointMsg += "," + String(newCloud[point][0]) + "," + String(newCloud[point][1]) + "," + String(newCloud[point][2]);
+          for (int i = 0; i < 3; i++) {
+            newCloudData.push_back(newCloud[point][i]);
+          }
         }
       }
-      serial_write(pointMsg);//TODO: Sending data takes 5ms, that is a problem! I think I need to send the data as a binary.
+      serial_write("newPts: ", newCloudData);
       size_t new_size = cloud.kdtree_get_point_count();
       //Add new points to index
       //This is the only O(n) part because tree is reformed after each chunk, luckily only done 15Hz not 15*64Hz
@@ -364,7 +386,8 @@ void setup()
     &Core1Task,
     1
   );
-  serial_queue = xQueueCreate(16, sizeof(const char *));
+  string_queue = xQueueCreate(16, sizeof(const char *));
+  data_queue = xQueueCreate(16, sizeof( std::vector<const float> *));
   xTaskCreatePinnedToCore(
     SerialLogger,
     "SerialLog",
