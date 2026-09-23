@@ -100,6 +100,9 @@ static void serial_write(const String msg, std::vector<float> data = {}) {
 void float2Bytes(byte bytes_temp[4],float float_variable) { 
   memcpy(bytes_temp, (unsigned char*) (&float_variable), 4);
 }
+const byte START_MARKER = 0x7E;
+const byte END_MARKER = 0x7F;
+const byte ESCAPE_BYTE = 0x7D;
 static void SerialLogger(void * pvParameters) {
   char * msg;
   std::vector<float> * data;
@@ -108,13 +111,20 @@ static void SerialLogger(void * pvParameters) {
     xQueueReceive(data_queue, &data, portMAX_DELAY);
     std::vector<float> realdata = data[0];
     SerialPort.print(msg);
+    SerialPort.write(START_MARKER);
     for (const auto& val : realdata) {
       byte bytes[4];
       float2Bytes(bytes, val);
       for (int i = 0; i < 4; i++) {
-        SerialPort.write(bytes[i]);
+        if (bytes[i] == END_MARKER || bytes[i] == ESCAPE_BYTE){
+          SerialPort.write(ESCAPE_BYTE);
+          SerialPort.write(bytes[i] ^ 0x20); // Swaps 6th bit, do again on receiver after escape byte to reverse.
+        } else {
+          SerialPort.write(bytes[i]);
+        }
       }
     }
+    SerialPort.write(END_MARKER);
     SerialPort.println();
     free(msg);
     delete data;
@@ -353,9 +363,9 @@ void setup()
 
   Wire.begin(); //This resets to 100kHz I2C
   Wire.setClock(400000); //IMU has max I2C freq of 400kHz 
-  SerialPort.println("Initializing sensor board. This can take up to 10s. Please wait.");
+  //SerialPort.println("Initializing sensor board. This can take up to 10s. Please wait.");
   if (ToF.begin() == false) {
-    SerialPort.println(F("ToF Sensor not found - check your wiring. Freezing"));
+    //SerialPort.println(F("ToF Sensor not found - check your wiring. Freezing"));
     while (1); 
   }
   ToF.setSharpenerPercent(ToF_Sharpness);

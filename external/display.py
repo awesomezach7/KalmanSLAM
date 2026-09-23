@@ -9,6 +9,8 @@ import viser.transforms as tf
 import trimesh
 from collections import deque
 
+import struct
+
 step_through = False
 breadboardScale = 2
 
@@ -45,8 +47,14 @@ def step(inputQueue, breadboard, pointCloud, newCloud):
         else:
             inputQueue.popleft()
             print("identifier failure")
-
+    
 def main():
+    START_MARKER = 0x7E
+    END_MARKER = 0x7F
+    ESCAPE_BYTE = 0x7D
+    in_packet = False
+    descriptorString = ""
+    floatBytes = []
     server = viser.ViserServer()
     mesh = trimesh.load_mesh(str(Path(__file__).parent / "breadboard.obj"))
     assert isinstance(mesh, trimesh.Trimesh)
@@ -78,48 +86,79 @@ def main():
         button.on_click(lambda _:(step(inputQueue, breadboard, pointCloud, newCloud)))
     while True:
         try:
-            Input = SerialPort.readline().decode('utf-8').rstrip()
+            Input = SerialPort.read(1)[0]
+            print(Input, ", in_packet = ", in_packet)
         except serial.serialutil.SerialException:
             while True:
-                time.sleep(1)
-        Parsed = Input.split(",")
-        if Parsed[0] == "NewPts":
-            pointCloudPoints = np.ndarray((0,3))
-            for i in range(1, int((len(Parsed)-1)/3)): # Start at 1 because 0th index is "NewPts"
-                try:
-                    if step_through:
-                        pointCloudPoints = np.append(pointCloudPoints, [float(Parsed[3*i-2]), float(Parsed[3*i-1]), float(Parsed[3*i])])
-                    else:
-                        pointCloud.points = np.append(pointCloud.points, [float(Parsed[3*i-2]), float(Parsed[3*i-1]), float(Parsed[3*i])])
-                except ValueError, IndexError:
-                    SerialPort.flushInput()
-                    SerialPort.flushOutput()
-            inputQueue.append(0)
-            inputQueue.append(pointCloudPoints)
-        if Parsed[0] == "OldPts" and step_through:
-            newCloudPoints = np.ndarray((0,3))
-            for i in range(1, int((len(Parsed)-1)/3)): # Start at 1 because 0th index is "NewPts"
-                try:
-                    newCloudPoints = np.append(newCloudPoints, [float(Parsed[3*i-2]), float(Parsed[3*i-1]), float(Parsed[3*i])])
-                except ValueError, IndexError:
-                    SerialPort.flushInput()
-                    SerialPort.flushOutput()
-            inputQueue.append(1)
-            inputQueue.append(newCloudPoints)
-        elif Parsed[0] == "Orient":
-            try:
-                if step_through:
-                    breadboardWxyz = tf.SO3.from_quaternion_xyzw(xyzw = np.array([float(Parsed[2]), float(Parsed[3]), float(Parsed[4]), float(Parsed[1])])).wxyz
-                    breadboardPosition = (float(Parsed[6]), float(Parsed[7]), float(Parsed[8]))
-                    breadboardVelocity = (float(Parsed[10]), float(Parsed[11]), float(Parsed[12]))
-                    inputQueue.append(2)
-                    inputQueue.append([breadboardWxyz, breadboardPosition, breadboardVelocity])
-                else:
-                    breadboard.wxyz = tf.SO3.from_quaternion_xyzw(xyzw = np.array([float(Parsed[2]), float(Parsed[3]), float(Parsed[4]), float(Parsed[1])])).wxyz
-                    breadboard.position = (float(Parsed[6]), float(Parsed[7]), float(Parsed[8]))
-            except ValueError, IndexError:
-                SerialPort.flushInput()
-                SerialPort.flushOutput()
+                time.sleep(1) # Pause indefinately if serial port is unplugged
+        if not in_packet:
+            if Input == START_MARKER :
+                in_packet = True
+            elif Input == 0x0A: #End of line, this implies serial_write was called with only a string
+                # convert floatBytes list to float list
+                print("----------------------------------------------")
+                print(descriptorString)
+                print(len(floatBytes))
+                print("----------------------------------------------")
+                if (len(floatBytes) % 4 == 0 and len(floatBytes) != 0) :
+                    num_floats = len(floatBytes) // 4
+                    floats = struct.unpack(f'{num_floats}f', bytes(floatBytes))
+                    if descriptorString.strip() == "newPts:":
+                        pointCloudPoints = np.ndarray((0,3))
+                        temp_list = pointCloud.points.tolist()
+                        if step_through:
+                            temp_list = pointCloudPoints.tolist()
+                        for i in range(0, (int(len(floats)/3)-1)): # Start at 1 because 0th index is "NewPts"
+                            try:
+                                if step_through:
+                                    pointCloudPoints = np.append(pointCloudPoints, [floats[3*i], floats[3*i+1], floats[3*i+2]])
+                                else:
+                                    pointCloud.points = np.append(pointCloud.points, [floats[3*i], floats[3*i+1], floats[3*i+2]])
+                            except ValueError, IndexError:
+                                SerialPort.flushInput()
+                                SerialPort.flushOutput()
+                        if step_through:
+                            inputQueue.append(0)
+                            inputQueue.append(pointCloudPoints)
+#                    elif descriptorString.strip() == "oldPts:" and step_through:
+#                        newCloudPoints = np.ndarray((0,3))
+#                        temp_list = newCloudPoints.tolist()
+#                        for i in range(0, (int(len(floats)/3)-1)): # Start at 1 because 0th index is "NewPts"
+#                            try:
+#                                temp_list.append([floats[3*i], floats[3*i+1], floats[3*i+2]])
+#                            except ValueError, IndexError:
+#                                SerialPort.flushInput()
+#                                SerialPort.flushOutput()
+#                        newCloudPoints = np.append(newCloudPoints, temp_list)
+#                        if step_through:
+#                            inputQueue.append(1)
+#                            inputQueue.append(newCloudPoints)
+                    elif descriptorString.strip() == "inertialUpdate:":
+                        try:
+                            if step_through:
+                                breadboardWxyz = tf.SO3.from_quaternion_xyzw(xyzw = np.array([floats[1], floats[2], floats[3], floats[0]])).wxyz
+                                breadboardPosition = (floats[4], floats[5], floats[6])
+                                breadboardVelocity = (floats[7], floats[8], floats[9])
+                                inputQueue.append(2)
+                                inputQueue.append([breadboardWxyz, breadboardPosition, breadboardVelocity])
+                            else:
+                                breadboard.wxyz = tf.SO3.from_quaternion_xyzw(xyzw = np.array([floats[1], floats[2], floats[3], floats[0]])).wxyz
+                                breadboard.position = (floats[4], floats[5], floats[6])
+                        except ValueError, IndexError:
+                            SerialPort.flushInput()
+                            SerialPort.flushOutput()
+                descriptorString = ""
+                floatBytes = []
+            else:
+                descriptorString += chr(Input)
+        else:
+            if Input == END_MARKER:
+                in_packet = False
+            else:
+                if Input == ESCAPE_BYTE:
+                    Input = SerialPort.read(1)[0] ^ 0x20
+                    print(Input)
+                floatBytes.append(Input)
 
 if __name__=="__main__":
     main()
