@@ -59,7 +59,7 @@ double pdist[64] = {};
 #define GyroFullScale 500
 #define AccFullScale 8
 #define microsteps 15
-#define USE_ACCELEROMETER false
+#define USE_ACCELEROMETER true
 
 //Alignment Tweaks
 #define max_leaf 12
@@ -69,13 +69,14 @@ double pdist[64] = {};
 #define DO_ALIGN false
 #define SEND_INTERMEDIATE_CLOUDS false
 
-const Eigen::Vector3d accoffset = {36.8,-2.87,-36.5};
-const Eigen::Vector3d gyrooffset = {-342.2, 448.3, 790.0};
 //Note that the type used for the point cloud is also tweakable (may use half_float for less memory usage)
 
 Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
+//Orientation is assumed perfect
 Eigen::Vector3d velocity(0.0, 0.0, 0.0);
+Eigen::Matrix3d velocityCov = Eigen::Matrix3d::Zero();
 Eigen::Vector3d position(0.0, 0.0, 0.0);
+std::vector<Eigen::Matrix3d> positionCov;
 
 #include <utils.h>
 PointCloud<float> cloud;
@@ -85,16 +86,34 @@ using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
 my_kd_tree_t tree_index(3, cloud, max_leaf);
 // Cannot call functions at top level to add points
 
+struct logMessage {
+  char * msg;
+  std::vector<float>* data;
+};
+
 #define SerialPort Serial
-static QueueHandle_t string_queue;
-static QueueHandle_t data_queue;
+static QueueHandle_t log_queue;
 static void serial_write(const String msg, std::vector<float> data = {}) {
   char * msgCopy = strdup(msg.c_str());
-  std::vector<float> * dataCopy = new std::vector<float>(data);
   if (msgCopy == NULL) {return;}
-  if (xQueueSend(string_queue, &msgCopy, 0) != pdPASS || xQueueSend(data_queue, &dataCopy, 0) != pdPASS) {
+  std::vector<float> * dataCopy = new std::vector<float>(data);
+  if (dataCopy == NULL) {
+    free(msgCopy);
+    return;
+  }
+  logMessage* message = new logMessage();
+  if (message == NULL) {
     free(msgCopy);
     delete dataCopy;
+    return;
+  }
+  message->msg = msgCopy;
+  message->data = dataCopy;
+  if (xQueueSend(log_queue, &message, 0) != pdPASS) {
+    // If the queue is full, delete everything cleanly in one place
+    free(message->msg);
+    delete message->data;
+    delete message; 
   }
 }
 void float2Bytes(byte bytes_temp[4],float float_variable) { 
@@ -104,32 +123,38 @@ const byte START_MARKER = 0x7E;
 const byte END_MARKER = 0x7F;
 const byte ESCAPE_BYTE = 0x7D;
 static void SerialLogger(void * pvParameters) {
+  logMessage* message;
   char * msg;
   std::vector<float> * data;
   for (;;) {
-    xQueueReceive(string_queue, &msg, portMAX_DELAY);
-    xQueueReceive(data_queue, &data, portMAX_DELAY);
-    std::vector<float> realdata = data[0];
+    xQueueReceive(log_queue, &message, portMAX_DELAY);
+    msg = message->msg;
+    data = message->data;
     SerialPort.print(msg);
-    SerialPort.write(START_MARKER);
-    for (const auto& val : realdata) {
-      byte bytes[4];
-      float2Bytes(bytes, val);
-      for (int i = 0; i < 4; i++) {
-        if (bytes[i] == END_MARKER || bytes[i] == ESCAPE_BYTE){
-          SerialPort.write(ESCAPE_BYTE);
-          SerialPort.write(bytes[i] ^ 0x20); // Swaps 6th bit, do again on receiver after escape byte to reverse.
-        } else {
-          SerialPort.write(bytes[i]);
+    if (data != nullptr && !data->empty()) {
+      SerialPort.write(START_MARKER);
+      for (const auto& val : *data) {
+        byte bytes[4];
+        float2Bytes(bytes, val);
+        for (int i = 0; i < 4; i++) {
+          if (bytes[i] == END_MARKER || bytes[i] == ESCAPE_BYTE){
+            SerialPort.write(ESCAPE_BYTE);
+            SerialPort.write(bytes[i] ^ 0x20); // Swaps 6th bit, do again on receiver after escape byte to reverse.
+          } else {
+            SerialPort.write(bytes[i]);
+          }
         }
       }
-    }
     SerialPort.write(END_MARKER);
+  }
     SerialPort.println();
     free(msg);
     delete data;
   }
 }
+
+Eigen::Vector3d accoffset = {15.83,-29.63,-37.28};
+Eigen::Vector3d gyrooffset = {-342.2, 448.3, 790.0};
 
 static void I2CIntegrator(void * pvParameters) {
   //IO Core
@@ -166,7 +191,12 @@ static void I2CIntegrator(void * pvParameters) {
       xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
       //Double integration step
       velocity += trueAccel * elapsedTime;
+      velocityCov += Eigen::Matrix3d::Identity()*std::pow(0.013 * elapsedTime, 2);
+      serial_write(String(std::sqrt(velocityCov(0, 0))));
+      serial_write(String(velocity(0)) + ", " + String(velocity(1)) + ", " + String(velocity(2)));
       position += velocity * elapsedTime;
+      positionCov.push_back(velocityCov * elapsedTime); //Each value of velocityCov will be findable in this data, thus velocityCov does not need to track past values
+      //positionCov should be added rather than inverse variance weighted as movement is (TODO: Generally) dependent
       xSemaphoreGive(inertialDataMutex);
     }
     vTaskDelay(1);
@@ -334,9 +364,60 @@ static void aligner(void * pvParameters){
   }
 }
 
+TaskHandle_t InitTask;
 TaskHandle_t Core0Task;
 TaskHandle_t Core1Task;
 TaskHandle_t SerialLog;
+
+static void calibrator(void * pvParameters) {
+  int calibratorStartTime = micros();
+  int n = 0;
+  Eigen::Vector3d accSum = Eigen::Vector3d::Zero();
+  Eigen::Vector3d gyroSum = Eigen::Vector3d::Zero();
+  while((micros() - calibratorStartTime)/1000000.0 < 5.0) {
+    vTaskDelay(1);
+    int32_t acc[3];
+    AccGyr.Get_X_Axes(acc);
+    Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>());
+    accelerometer[2] -= 1000;
+    accSum += accelerometer;
+    int32_t gyro[3];
+    AccGyr.Get_G_Axes(gyro);
+    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>();
+    gyroSum += gyroscope;
+    n++;
+  }
+  accoffset = -accSum / n;
+  gyrooffset = -gyroSum / n;
+  xTaskCreatePinnedToCore(
+    aligner,
+    "Core0Task",
+    32768,
+    NULL,
+    2,
+    &Core0Task,
+    0
+  );
+  xTaskCreatePinnedToCore(
+    I2CIntegrator,
+    "Core1Task",
+    8192,
+    NULL,
+    3,
+    &Core1Task,
+    1
+  );
+  xTaskCreatePinnedToCore(
+    SerialLogger,
+    "SerialLog",
+    4096,
+    NULL,
+    2,
+    &SerialLog,
+    1
+  );
+  vTaskDelete(NULL);
+}
 
 void setup()
 {
@@ -359,6 +440,8 @@ void setup()
   AccGyr.Enable_G();
   AccGyr.Set_G_FS(GyroFullScale);
   AccGyr.Set_X_FS(AccFullScale);
+  AccGyr.Set_X_ODR(208.0f); // Set Accelerometer to 208 Hz
+  AccGyr.Set_G_ODR(208.0f); // Set Gyroscope to 208 Hz
   delay(20);
 
   Wire.begin(); //This resets to 100kHz I2C
@@ -378,34 +461,15 @@ void setup()
   xCoreSyncSemaphore = xSemaphoreCreateBinary();
   distDataMutex = xSemaphoreCreateMutex();
   inertialDataMutex = xSemaphoreCreateMutex();
+  log_queue = xQueueCreate(16, sizeof(logMessage*));
   xTaskCreatePinnedToCore(
-    aligner,
-    "Core0Task",
-    32768,
+    calibrator,
+    "InitTask",
+    8192,
     NULL,
     2,
-    &Core0Task,
+    &InitTask,
     0
-  ); //Last param pins this task to core 0
-  xTaskCreatePinnedToCore(
-    I2CIntegrator,
-    "Core1Task",
-    16384,
-    NULL,
-    3,
-    &Core1Task,
-    1
-  );
-  string_queue = xQueueCreate(16, sizeof(const char *));
-  data_queue = xQueueCreate(16, sizeof( std::vector<const float> *));
-  xTaskCreatePinnedToCore(
-    SerialLogger,
-    "SerialLog",
-    4096,
-    NULL,
-    2,
-    &SerialLog,
-    1
   );
 }
 
