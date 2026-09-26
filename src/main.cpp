@@ -96,23 +96,18 @@ static void I2CIntegrator(void * pvParameters) {
     vTaskDelay(1);
     //Blink LED
     digitalWrite(LED_BUILTIN, (millis() / 1000) % 2);
-    // Read gyroscope.
-    int32_t gyro[3];
-    AccGyr.Get_G_Axes(gyro);
-    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>() + gyrooffset;
+    //Get Elapsed Time
     if (firstLoop) {firstLoop = false; startTime = micros();}
     endTime = micros();
     elapsedTime = double(endTime - startTime)/1000000.0; //seconds
     startTime = micros();
-    serial_write(String(elapsedTime));
-    serial_write(String(gyroscope[0]) + ", " + String(gyroscope[1]) + ", " + String(gyroscope[2]));
-    Eigen::Vector3d halfAngleMove = gyroscope * (0.001) * (PI/180.0) * elapsedTime * (0.5);
+    // Read gyroscope.
+    int32_t gyro[3];
+    AccGyr.Get_G_Axes(gyro);
+    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>() + gyrooffset;
+    Eigen::Vector3d dAngleHalf = gyroscope * (0.001) * (PI/180.0) * elapsedTime * (0.5);
     xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
-    for (int i = 0; i < microsteps; i++) { //Apply quaternions evenly through several steps
-      Orientation *= Eigen::Quaterniond(cos( halfAngleMove[0]/microsteps), sin( halfAngleMove[0]/microsteps), 0, 0);
-      Orientation *= Eigen::Quaterniond(cos( halfAngleMove[1]/microsteps), 0, sin( halfAngleMove[1]/microsteps), 0);
-      Orientation *= Eigen::Quaterniond(cos( halfAngleMove[2]/microsteps), 0, 0, sin( halfAngleMove[2]/microsteps));
-    }
+    Orientation *= Eigen::Quaterniond(cos(dAngleHalf.norm()), sin(dAngleHalf[0]), sin(dAngleHalf[1]), sin(dAngleHalf[2]));
     Orientation.normalize();
     xSemaphoreGive(inertialDataMutex);
     if (USE_ACCELEROMETER) {
@@ -146,7 +141,7 @@ static void I2CIntegrator(void * pvParameters) {
     if (ToF.isDataReady()) {
       xSemaphoreTake(distDataMutex, portMAX_DELAY);
       if (ToF.getRangingData(&distData)){
-        xSemaphoreGive(xCoreSyncSemaphore);
+        xSemaphoreGive(xCoreSyncSemaphore); // Might replace with queue?
         serial_write("ToF Data read");
       }
       xSemaphoreGive(distDataMutex);
@@ -309,7 +304,7 @@ static void calibrator(void * pvParameters) {
   int n = 0;
   Eigen::Vector3d accSum = Eigen::Vector3d::Zero();
   Eigen::Vector3d gyroSum = Eigen::Vector3d::Zero();
-  while((micros() - calibratorStartTime)/1000000.0 < 3.0) {
+  while((micros() - calibratorStartTime)/1000000.0 < 5.0) {
     vTaskDelay(1);
     int32_t acc[3];
     AccGyr.Get_X_Axes(acc);
@@ -351,7 +346,7 @@ static void calibrator(void * pvParameters) {
     &SerialLog,
     1
   );
-  vTaskDelete(NULL);
+  vTaskDelete(NULL); //Tasks reaching the end causes an error
 }
 
 void setup()
