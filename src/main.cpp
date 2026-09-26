@@ -104,11 +104,12 @@ static void I2CIntegrator(void * pvParameters) {
     endTime = micros();
     elapsedTime = double(endTime - startTime)/1000000.0; //seconds
     startTime = micros();
+    Eigen::Vector3d angleMove = gyroscope * (1/1000) *(PI/180) * elapsedTime;
     xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
     for (int i = 0; i < microsteps; i++) { //Apply quaternions evenly through several steps
-      Orientation *= Eigen::Quaterniond(cos(elapsedTime * (double(-gyroscope[0])*PI)/(1000*180*2*microsteps)), sin(elapsedTime * (double(-gyroscope[0])*PI)/(1000*180*2*microsteps)), 0, 0);
-      Orientation *= Eigen::Quaterniond(cos(elapsedTime * (double(gyroscope[1])*PI)/(1000*180*2*microsteps)), 0, sin(elapsedTime * (double(gyroscope[1])*PI)/(1000*180*2*microsteps)), 0);
-      Orientation *= Eigen::Quaterniond(cos(elapsedTime * (double(gyroscope[2])*PI)/(1000*180*2*microsteps)), 0, 0, sin(elapsedTime * (double(gyroscope[2])*PI)/(1000*180*2*microsteps)));
+      Orientation *= Eigen::Quaterniond(cos(elapsedTime * -angleMove[0]/(2*microsteps)), sin(elapsedTime * -angleMove[0]/(2*microsteps)), 0, 0);
+      Orientation *= Eigen::Quaterniond(cos(elapsedTime * angleMove[1]/(2*microsteps)), 0, sin(elapsedTime * angleMove[1]/(2*microsteps)), 0);
+      Orientation *= Eigen::Quaterniond(cos(elapsedTime * angleMove[2]/(2*microsteps)), 0, 0, sin(elapsedTime * angleMove[2]/(2*microsteps)));
     }
     Orientation.normalize();
     xSemaphoreGive(inertialDataMutex);
@@ -117,7 +118,7 @@ static void I2CIntegrator(void * pvParameters) {
       int32_t acc[3];
       AccGyr.Get_X_Axes(acc);
       //SENSOR Reference Frame
-      Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accoffset) * 9.8/1000;
+      Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accoffset) * 9.8066/1000;
       //GLOBAL Reference Frame
       Eigen::Vector3d trueAccel(Orientation * accelerometer);
       //Subtract Gravity
