@@ -87,7 +87,6 @@ def main():
     while True:
         try:
             Input = SerialPort.read(1)[0]
-            print(Input, ", in_packet = ", in_packet)
         except serial.serialutil.SerialException:
             while True:
                 time.sleep(1) # Pause indefinately if serial port is unplugged
@@ -96,10 +95,6 @@ def main():
                 in_packet = True
             elif Input == 0x0A: #End of line, this implies serial_write was called with only a string
                 # convert floatBytes list to float list
-                print("----------------------------------------------")
-                print(descriptorString)
-                print(len(floatBytes))
-                print("----------------------------------------------")
                 if (len(floatBytes) % 4 == 0 and len(floatBytes) != 0) :
                     num_floats = len(floatBytes) // 4
                     floats = struct.unpack(f'{num_floats}f', bytes(floatBytes))
@@ -157,7 +152,6 @@ def main():
             else:
                 if Input == ESCAPE_BYTE:
                     Input = SerialPort.read(1)[0] ^ 0x20
-                    print(Input)
                 floatBytes.append(Input)
 
 if __name__=="__main__":

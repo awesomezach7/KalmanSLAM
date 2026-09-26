@@ -6,7 +6,6 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
-#include "queue.h"
 
 static SemaphoreHandle_t xCoreSyncSemaphore;
 static SemaphoreHandle_t distDataMutex;
@@ -86,72 +85,7 @@ using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
 my_kd_tree_t tree_index(3, cloud, max_leaf);
 // Cannot call functions at top level to add points
 
-struct logMessage {
-  char * msg;
-  std::vector<float>* data;
-};
-
-#define SerialPort Serial
-static QueueHandle_t log_queue;
-static void serial_write(const String msg, std::vector<float> data = {}) {
-  char * msgCopy = strdup(msg.c_str());
-  if (msgCopy == NULL) {return;}
-  std::vector<float> * dataCopy = new std::vector<float>(data);
-  if (dataCopy == NULL) {
-    free(msgCopy);
-    return;
-  }
-  logMessage* message = new logMessage();
-  if (message == NULL) {
-    free(msgCopy);
-    delete dataCopy;
-    return;
-  }
-  message->msg = msgCopy;
-  message->data = dataCopy;
-  if (xQueueSend(log_queue, &message, 0) != pdPASS) {
-    // If the queue is full, delete everything cleanly in one place
-    free(message->msg);
-    delete message->data;
-    delete message; 
-  }
-}
-void float2Bytes(byte bytes_temp[4],float float_variable) { 
-  memcpy(bytes_temp, (unsigned char*) (&float_variable), 4);
-}
-const byte START_MARKER = 0x7E;
-const byte END_MARKER = 0x7F;
-const byte ESCAPE_BYTE = 0x7D;
-static void SerialLogger(void * pvParameters) {
-  logMessage* message;
-  char * msg;
-  std::vector<float> * data;
-  for (;;) {
-    xQueueReceive(log_queue, &message, portMAX_DELAY);
-    msg = message->msg;
-    data = message->data;
-    SerialPort.print(msg);
-    if (data != nullptr && !data->empty()) {
-      SerialPort.write(START_MARKER);
-      for (const auto& val : *data) {
-        byte bytes[4];
-        float2Bytes(bytes, val);
-        for (int i = 0; i < 4; i++) {
-          if (bytes[i] == END_MARKER || bytes[i] == ESCAPE_BYTE){
-            SerialPort.write(ESCAPE_BYTE);
-            SerialPort.write(bytes[i] ^ 0x20); // Swaps 6th bit, do again on receiver after escape byte to reverse.
-          } else {
-            SerialPort.write(bytes[i]);
-          }
-        }
-      }
-    SerialPort.write(END_MARKER);
-  }
-    SerialPort.println();
-    free(msg);
-    delete data;
-  }
-}
+#include <serial_write.h>
 
 Eigen::Vector3d accoffset = {15.83,-29.63,-37.28};
 Eigen::Vector3d gyrooffset = {-342.2, 448.3, 790.0};
@@ -187,13 +121,11 @@ static void I2CIntegrator(void * pvParameters) {
       //GLOBAL Reference Frame
       Eigen::Vector3d trueAccel(Orientation * accelerometer);
       //Subtract Gravity
-      trueAccel[2] -= 9.8;
+      trueAccel[2] -= 9.8066;
       xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
       //Double integration step
       velocity += trueAccel * elapsedTime;
       velocityCov += Eigen::Matrix3d::Identity()*std::pow(0.013 * elapsedTime, 2);
-      serial_write(String(std::sqrt(velocityCov(0, 0))));
-      serial_write(String(velocity(0)) + ", " + String(velocity(1)) + ", " + String(velocity(2)));
       position += velocity * elapsedTime;
       positionCov.push_back(velocityCov * elapsedTime); //Each value of velocityCov will be findable in this data, thus velocityCov does not need to track past values
       //positionCov should be added rather than inverse variance weighted as movement is (TODO: Generally) dependent
@@ -374,7 +306,7 @@ static void calibrator(void * pvParameters) {
   int n = 0;
   Eigen::Vector3d accSum = Eigen::Vector3d::Zero();
   Eigen::Vector3d gyroSum = Eigen::Vector3d::Zero();
-  while((micros() - calibratorStartTime)/1000000.0 < 5.0) {
+  while((micros() - calibratorStartTime)/1000000.0 < 3.0) {
     vTaskDelay(1);
     int32_t acc[3];
     AccGyr.Get_X_Axes(acc);
@@ -461,7 +393,6 @@ void setup()
   xCoreSyncSemaphore = xSemaphoreCreateBinary();
   distDataMutex = xSemaphoreCreateMutex();
   inertialDataMutex = xSemaphoreCreateMutex();
-  log_queue = xQueueCreate(16, sizeof(logMessage*));
   xTaskCreatePinnedToCore(
     calibrator,
     "InitTask",
