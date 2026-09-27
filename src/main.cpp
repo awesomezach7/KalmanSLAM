@@ -16,11 +16,6 @@ static SemaphoreHandle_t inertialDataMutex;
 #define IMU_I2C Wire
 // Components
 LSM6DSO32Sensor AccGyr(&IMU_I2C);
-//elapsedTime init for integration
-unsigned long startTime = micros();
-bool firstLoop = true;
-unsigned long endTime = micros();
-double elapsedTime = endTime - startTime;
 
 #include <SparkFun_VL53L5CX_Library.h> //http://librarymanager/All#SparkFun_VL53L5CX
 #include <Wire.h>
@@ -71,11 +66,11 @@ double pdist[64] = {};
 //Note that the type used for the point cloud is also tweakable (may use half_float for less memory usage)
 
 Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
-//Orientation is assumed perfect
 Eigen::Vector3d velocity(0.0, 0.0, 0.0);
 Eigen::Matrix3d velocityCov = Eigen::Matrix3d::Zero();
 Eigen::Vector3d position(0.0, 0.0, 0.0);
-std::vector<Eigen::Matrix3d> positionCov;
+
+std::vector<Eigen::MatrixXd> poseCov;
 
 #include <utils.h>
 PointCloud<float> cloud;
@@ -87,49 +82,58 @@ my_kd_tree_t tree_index(3, cloud, max_leaf);
 
 #include <serial_write.h>
 
-Eigen::Vector3d accoffset = {15.83,-29.63,-37.28};
-Eigen::Vector3d gyrooffset = {-342.2, 448.3, 790.0};
+Eigen::Vector3d accOffset = {15.83,-29.63,-37.28};
+Eigen::Vector3d accVari = Eigen::Vector3d::Zero();
+Eigen::Vector3d gyroOffset = {-342.2, 448.3, 790.0};
+Eigen::Vector3d gyroVari = Eigen::Vector3d::Zero();
 
 static void I2CIntegrator(void * pvParameters) {
+  //elapsedTime init for integration
+  unsigned long startTime = micros();
+  unsigned long endTime;
+  double elapsedTime;
   //IO Core
   for(;;) {
     vTaskDelay(1);
-    //Blink LED
+
+    // Blink LED
     digitalWrite(LED_BUILTIN, (millis() / 1000) % 2);
-    //Get Elapsed Time
-    if (firstLoop) {firstLoop = false; startTime = micros();}
+
+    // Get Elapsed Time
     endTime = micros();
     elapsedTime = double(endTime - startTime)/1000000.0; //seconds
-    startTime = micros();
+    startTime = endTime;
+
     // Read gyroscope.
     int32_t gyro[3];
     AccGyr.Get_G_Axes(gyro);
-    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>() + gyrooffset;
-    Eigen::Vector3d dAngleHalf = gyroscope * (0.001) * (PI/180.0) * elapsedTime * (0.5);
+    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>() + gyroOffset;
+    Eigen::Vector3d dAngleHalf = gyroscope * (0.001) * (PI/180.0) * elapsedTime * (0.5); //Avoid int casting
     xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
     Orientation *= Eigen::Quaterniond(cos(dAngleHalf.norm()), sin(dAngleHalf[0]), sin(dAngleHalf[1]), sin(dAngleHalf[2]));
     Orientation.normalize();
+    // TODO: Update Kalman Filter
+
     xSemaphoreGive(inertialDataMutex);
-    if (USE_ACCELEROMETER) {
-      // Read accelerometer
-      int32_t acc[3];
-      AccGyr.Get_X_Axes(acc);
-      //SENSOR Reference Frame
-      Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accoffset) * 9.8066/1000;
-      //GLOBAL Reference Frame
-      Eigen::Vector3d trueAccel(Orientation * accelerometer);
-      //Subtract Gravity
-      trueAccel[2] -= 9.8066;
-      xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
-      //Double integration step
-      velocity += trueAccel * elapsedTime;
-      velocityCov += Eigen::Matrix3d::Identity()*std::pow(0.013 * elapsedTime, 2);
-      position += velocity * elapsedTime;
-      positionCov.push_back(velocityCov * elapsedTime); //Each value of velocityCov will be findable in this data, thus velocityCov does not need to track past values
-      //positionCov should be added rather than inverse variance weighted as movement is (TODO: Generally) dependent
-      xSemaphoreGive(inertialDataMutex);
-    }
+
+    // Read accelerometer
+    int32_t acc[3];
+    AccGyr.Get_X_Axes(acc);
+    // SENSOR Reference Frame
+    Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accOffset) * 9.8066/1000;
+    // GLOBAL Reference Frame
+    Eigen::Vector3d trueAccel(Orientation * accelerometer);
+    // Subtract Gravity
+    trueAccel[2] -= 9.8066;
+    xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
+    // Double integration step
+    velocity += trueAccel * elapsedTime;
+    position += velocity * elapsedTime;
+    // TODO: Update Kalman Filter
+
+    xSemaphoreGive(inertialDataMutex);
     vTaskDelay(1);
+
     // Output data.
     std::vector<float> inertialUpdateData = {
       static_cast<float>(Orientation.w()), static_cast<float>(Orientation.x()), static_cast<float>(Orientation.y()), static_cast<float>(Orientation.z()),
@@ -138,6 +142,8 @@ static void I2CIntegrator(void * pvParameters) {
       static_cast<float>(elapsedTime * 1000)
     };
     serial_write("inertialUpdate: ", inertialUpdateData);
+
+    // Read VL53L5CX I2C data
     if (ToF.isDataReady()) {
       xSemaphoreTake(distDataMutex, portMAX_DELAY);
       if (ToF.getRangingData(&distData)){
@@ -156,7 +162,7 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
   for (int y = 0 ; y <= imageWidth * (imageWidth - 1) ; y += imageWidth) {
     for (int x = imageWidth - 1 ; x >= 0 ; x--) {
       double dist = distData.distance_mm[x + y]/1000.0; //Converted to meters
-      if (pdist[x+y] != dist && dist != 0){ //Some extra complexity is added to ignore instances where the sensor does not give a new distance and reports the previous distance
+      if (pdist[x+y] != dist && dist != 0) { //Some extra complexity is added to ignore instances where the sensor does not give a new distance and reports the previous distance
         // === ST Lookup Table Method ===
         // Compute sin/cos for ST-calibrated pitch/yaw angles
         double pitch_rad = ST_PITCH_ANGLES_DEG[63-(x+y)] * DEG_TO_RAD;
@@ -183,7 +189,7 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
   xSemaphoreGive(distDataMutex);
 }
 
-static void aligner(void * pvParameters){
+static void aligner(void * pvParameters) {
   for(;;){
     vTaskDelay(1);//for watchdog
     // SLAM: Core 0
@@ -302,23 +308,31 @@ TaskHandle_t SerialLog;
 static void calibrator(void * pvParameters) {
   int calibratorStartTime = micros();
   int n = 0;
-  Eigen::Vector3d accSum = Eigen::Vector3d::Zero();
-  Eigen::Vector3d gyroSum = Eigen::Vector3d::Zero();
-  while((micros() - calibratorStartTime)/1000000.0 < 5.0) {
+  Eigen::Vector3d accMean = Eigen::Vector3d::Zero();
+  Eigen::Vector3d accM2 = Eigen::Vector3d::Zero();
+  Eigen::Vector3d gyroMean = Eigen::Vector3d::Zero();
+  Eigen::Vector3d gyroM2 = Eigen::Vector3d::Zero();
+  while((micros() - calibratorStartTime)/1000000.0 < 5.0) { //Repeat Welford's Algorithm to get variances
     vTaskDelay(1);
+    n++;
     int32_t acc[3];
     AccGyr.Get_X_Axes(acc);
     Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>());
     accelerometer[2] -= 1000;
-    accSum += accelerometer;
+    Eigen::Vector3d accDelta = accelerometer - accMean;
+    accMean += accDelta / n;
+    accM2 += (accelerometer - accMean) * accDelta;
     int32_t gyro[3];
     AccGyr.Get_G_Axes(gyro);
     Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>();
-    gyroSum += gyroscope;
-    n++;
+    Eigen::Vector3d gyroDelta = gyroscope - gyroMean;
+    gyroMean += gyroDelta / n;
+    gyroM2 += (gyroscope - gyroMean) * gyroDelta;
   }
-  accoffset = -accSum / n;
-  gyrooffset = -gyroSum / n;
+  accOffset = -accMean;
+  accVari = accM2 / (n-1); //Bessel's Correction
+  gyroOffset = -gyroMean;
+  gyroVari = gyroM2 / (n-1);
   xTaskCreatePinnedToCore(
     aligner,
     "Core0Task",
@@ -349,19 +363,18 @@ static void calibrator(void * pvParameters) {
   vTaskDelete(NULL); //Tasks reaching the end causes an error
 }
 
-void setup()
-{
+void setup() {
   delay(5);
   // Led.
   pinMode(LED_BUILTIN, OUTPUT);
 
   // Initialize serial for output.
-  SerialPort.begin(115200);
+  Serial.begin(115200);
   delay(50);
-  while (!SerialPort) {
+  while (!Serial) {
     delay(10);
   }
-  SerialPort.write("Setting up...");
+  Serial.write("Setting up...");
 
   // Initialize I2C bus.
   IMU_I2C.begin();
@@ -376,9 +389,9 @@ void setup()
 
   Wire.begin(); //This resets to 100kHz I2C
   Wire.setClock(400000); //IMU has max I2C freq of 400kHz 
-  //SerialPort.println("Initializing sensor board. This can take up to 10s. Please wait.");
+  Serial.println("Initializing sensor board. This can take up to 10s. Please wait.");
   if (ToF.begin() == false) {
-    //SerialPort.println(F("ToF Sensor not found - check your wiring. Freezing"));
+    Serial.println(F("ToF Sensor not found - check your wiring. Freezing"));
     while (1); 
   }
   ToF.setSharpenerPercent(ToF_Sharpness);
@@ -391,6 +404,7 @@ void setup()
   xCoreSyncSemaphore = xSemaphoreCreateBinary();
   distDataMutex = xSemaphoreCreateMutex();
   inertialDataMutex = xSemaphoreCreateMutex();
+  
   xTaskCreatePinnedToCore(
     calibrator,
     "InitTask",
