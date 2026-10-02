@@ -57,20 +57,10 @@ double pdist[64] = {};
 
 //Alignment Tweaks
 #define max_leaf 12
-#define alignment_iterations 2
-#define filter_distance 0.4
-#define min_matches 30
+#define filter_stdevs 2
 #define DO_ALIGN false
-#define SEND_INTERMEDIATE_CLOUDS false
 
 //Note that the type used for the point cloud is also tweakable (may use half_float for less memory usage)
-
-Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
-Eigen::Vector3d velocity(0.0, 0.0, 0.0);
-Eigen::Matrix3d velocityCov = Eigen::Matrix3d::Zero();
-Eigen::Vector3d position(0.0, 0.0, 0.0);
-
-std::vector<Eigen::MatrixXd> poseCov;
 
 #include <utils.h>
 PointCloud<float> cloud;
@@ -87,11 +77,21 @@ Eigen::Vector3d accVari = Eigen::Vector3d::Zero();
 Eigen::Vector3d gyroOffset = {-342.2, 448.3, 790.0};
 Eigen::Vector3d gyroVari = Eigen::Vector3d::Zero();
 
+Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
+Eigen::Vector3d velocity(0.0, 0.0, 0.0);
+Eigen::Matrix3d velocityCov = Eigen::Matrix3d::Zero();
+Eigen::Vector3d position(0.0, 0.0, 0.0);
+
+std::vector<Eigen::Matrix<double, 6, 6>> poseCov; 
+// X, Y, Z -> relative to last iteration
+// 3 orientation values -> absolute
+
 static void I2CIntegrator(void * pvParameters) {
   //elapsedTime init for integration
   unsigned long startTime = micros();
   unsigned long endTime;
   double elapsedTime;
+  Eigen::Matrix<double, 6, 6> tempCov = Eigen::Matrix<double, 6, 6>::Zero();
   //IO Core
   for(;;) {
     vTaskDelay(1);
@@ -108,12 +108,11 @@ static void I2CIntegrator(void * pvParameters) {
     int32_t gyro[3];
     AccGyr.Get_G_Axes(gyro);
     Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>() + gyroOffset;
-    Eigen::Vector3d dAngleHalf = gyroscope * (0.001) * (PI/180.0) * elapsedTime * (0.5); //Avoid int casting
+    double radConvert = elapsedTime * (0.001) * (PI/180.0);
+    Eigen::Vector3d dAngleHalf = gyroscope * radConvert * (0.5); //Avoid int casting
     xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
     Orientation *= Eigen::Quaterniond(cos(dAngleHalf.norm()), sin(dAngleHalf[0]), sin(dAngleHalf[1]), sin(dAngleHalf[2]));
     Orientation.normalize();
-    // TODO: Update Kalman Filter
-
     xSemaphoreGive(inertialDataMutex);
 
     // Read accelerometer
@@ -121,16 +120,19 @@ static void I2CIntegrator(void * pvParameters) {
     AccGyr.Get_X_Axes(acc);
     // SENSOR Reference Frame
     Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accOffset) * 9.8066/1000;
+    xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
     // GLOBAL Reference Frame
     Eigen::Vector3d trueAccel(Orientation * accelerometer);
     // Subtract Gravity
     trueAccel[2] -= 9.8066;
-    xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
     // Double integration step
     velocity += trueAccel * elapsedTime;
     position += velocity * elapsedTime;
     // TODO: Update Kalman Filter
-
+    //UNCERTAINTIES:
+    // accelerometer: accVari * 9.8066/1000
+    // orientation: previous value + gyroVari
+    
     xSemaphoreGive(inertialDataMutex);
     vTaskDelay(1);
 
@@ -151,6 +153,8 @@ static void I2CIntegrator(void * pvParameters) {
         serial_write("ToF Data read");
       }
       xSemaphoreGive(distDataMutex);
+      poseCov.push_back(tempCov);
+      tempCov = Eigen::Matrix<double, 6, 6>::Zero();
     }
   }
 }
@@ -173,12 +177,12 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
         double st_ray_dir_x = -std::cos(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         double st_ray_dir_y = std::sin(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         //Point in SENSOR reference frame:
-        Eigen::Vector3d point = {st_ray_dir_y * dist, st_ray_dir_x * dist, dist};
-        //Point in GLOBAL reference frame:
+        newCloud[x+y] = {st_ray_dir_y * dist, st_ray_dir_x * dist, dist};
+        /*Point in GLOBAL reference frame:
         xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
         Eigen::Vector3f point_prime = (Orientation * point).cast<float>();
         newCloud[x+y] = {point_prime.x() + float(position[0]), point_prime.y() + float(position[1]), point_prime.z() + float(position[2])}; //Quaternion + position
-        xSemaphoreGive(inertialDataMutex);
+        xSemaphoreGive(inertialDataMutex);*/
         pdist[x+y] = dist;
         hasData[x+y] = true;
       } else {
@@ -189,8 +193,8 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
   xSemaphoreGive(distDataMutex);
 }
 
-static void aligner(void * pvParameters) {
-  for(;;){
+static void surfaceMatcher(void * pvParameters) {
+  for(;;) {
     vTaskDelay(1);//for watchdog
     // SLAM: Core 0
     // Distance Sensor Output (Populating newCloud)
@@ -198,110 +202,38 @@ static void aligner(void * pvParameters) {
       std::array<Eigen::Vector3f, 64> newCloud;
       std::array<boolean, 64> hasData;
       interpretDistances(distData, newCloud, hasData);
-      //Alignment
+      // TODO: Turn pointCloud in sensor space into representative planes
       if (!cloud.pts.empty()) {
-        for (int i = 0; i < alignment_iterations; i++) {
-          if (SEND_INTERMEDIATE_CLOUDS) {
-            std::vector<float> intermediateCloudData;
-            for(int point = 0; point < 64; point++) {
-              if (hasData[point]) {
-                for (int i = 0; i < 3; i++) {
-                  intermediateCloudData.push_back(newCloud[point][i]);
-                }
-              }
-            }
-            serial_write("intermediatePts: ", intermediateCloudData);
-          }
-          Eigen::MatrixXd A = Eigen::MatrixXd::Zero(64, 6);
-          Eigen::VectorXd b = Eigen::VectorXd::Zero(64);
-          int n = 0;
-          for (int point = 0; point < 64; point++) { //Iterate over every point
-            if (hasData[point]) {
-              //Search kd tree to find closest point
-              const size_t num_results = 3;
-              nanoflann::KNNResultSet<float> resultSet(num_results);
-              size_t ret_index[num_results];
-              float out_dist_sqr[num_results]; //Square of distance
-              resultSet.init(ret_index, out_dist_sqr);
-              float query_pt[3] = {newCloud[point][0], newCloud[point][1], newCloud[point][2]};
-              tree_index.findNeighbors(resultSet, query_pt, {});
-              if (out_dist_sqr[2] <= filter_distance*filter_distance) { // For filtering, the closest point needs to be relatively close
-                n++;
-                //Normal vector is cross product of two vectors between points on the plane
-                PointCloud<float>::Point pt1 = cloud.pts[ret_index[0]];
-                PointCloud<float>::Point pt2 = cloud.pts[ret_index[1]];
-                PointCloud<float>::Point pt3 = cloud.pts[ret_index[2]];
-                //Eigen::Vector3f point1 = {pt1.x, pt1.y, pt1.z};
-                float a_1 = pt1.x - pt2.x; float a_2 = pt1.y - pt2.y; float a_3 = pt1.z - pt2.z;
-                float b_1 = pt1.x - pt3.x; float b_2 = pt1.y - pt3.y; float b_3 = pt1.z - pt3.z;
-                float nx = (a_2 * b_3) - (a_3 * b_2); // normal vector values
-                float ny = (a_3 * b_1) - (a_1 * b_3);
-                float nz = (a_1 * b_2) - (a_2 * b_1);
-                //This can be any scale, because increasing the scale scales up A and b, which is cancelled at Eigen::pseudoInverse(A)*b.
-                float dx = pt1.x; float dy = pt1.y; float dz = pt1.z;
-                float sx = newCloud[point][0]; float sy = newCloud[point][1]; float sz = newCloud[point][2];
-                Eigen::VectorXd row(6); //Without (6), this has a runtime CommaInitializer error
-                row << nz*sy - ny*sz, nx*sz - nz*sx, ny*sx - nx*sy, nx, ny, nz;
-                double value = nx*dx + ny*dy + nz*dz - nx*sx - ny*sy - nz*sz;
-                A.row(n - 1) = row;
-                b(n - 1) = value;
-              }
-            }
-          }
-          serial_write("All points processed for iteration: " + String(i + 1) + ", and there were " + String(n) + " good points");
-          Eigen::Matrix4d transform_opt;
-          if (A.rows() == 0 || A.cols() == 0 || !A.allFinite() || A.cwiseAbs().maxCoeff() == 0.0 || n < min_matches || !DO_ALIGN) {
-            //Revert to using identity matrix
-            if (DO_ALIGN) {
-              serial_write("bad or not enough data for cloud alignment");
-            }
-            transform_opt << 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1;
-          } else {
-            //Free extra size of MatrixXd based on final value of n
-            A.conservativeResize(n, 6);
-            b.conservativeResize(n);
-            Eigen::VectorXd x_opt = Eigen::pseudoInverse(A)*b;
-            //Turn x_opt into the 4x4 matrix transform it optimized for
-            transform_opt << 1, -x_opt(2), x_opt(1), x_opt(3), x_opt(2), 1, -x_opt(0), x_opt(4), -x_opt(1), x_opt(0), 1, x_opt(5), 0, 0, 0, 1;
-          }
-          Eigen::Quaterniond transform_quat(transform_opt.topLeftCorner<3,3>());
-          Eigen::Transform<double, 3, Eigen::Affine> transform(transform_opt); //Can be applied directly to 3d vectors now
-          xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
-          Orientation *= transform_quat;
-          position = transform * position;
-          xSemaphoreGive(inertialDataMutex);
-          //Apply optimal transformation to newCloud
-          for(int point = 0; point < 64; point++) {
-            if (hasData[point]) {
-              newCloud[point] = transform.cast<float>() * newCloud[point];
-            }
-          }
-        }
+        // TODO: Find any matching surfaces that appear to be the same surface
+        // TODO: Write the alignment of the surfaces as a square to minimize
       }
-      //All iterations completed, newCloud now has points that line up with previous points (Or nothing happened if cloud.pts.empty())
-      //Update Kd Tree
-      size_t old_size = cloud.kdtree_get_point_count();
-      std::vector<float> newCloudData;
-      for(int point = 0; point < 64; point++) {
-        if (hasData[point]) {
-          cloud.pts.push_back({newCloud[point][0], newCloud[point][1], newCloud[point][2]});
-          for (int i = 0; i < 3; i++) {
-            newCloudData.push_back(newCloud[point][i]);
-          }
-        }
+    }
+  }
+}
+      
+
+static void aligner(void * pvParameters) {
+  for(;;) {
+    //Alignment
+    if (!cloud.pts.empty()) {
+      Eigen::MatrixXd A = Eigen::MatrixXd::Zero(64, 6);
+      Eigen::VectorXd b = Eigen::VectorXd::Zero(64);
+      int n = 0;
+      if (A.rows() == 0 || A.cols() == 0 || !A.allFinite() || A.cwiseAbs().maxCoeff() == 0.0) {
+        //Failed
+      } else {
+        //Free extra size of MatrixXd based on final value of n
+        A.conservativeResize(n, 6);
+        b.conservativeResize(n);
+        Eigen::VectorXd x_opt = Eigen::pseudoInverse(A)*b;
       }
-      serial_write("newPts: ", newCloudData);
-      size_t new_size = cloud.kdtree_get_point_count();
-      //Add new points to index
-      //This is the only O(n) part because tree is reformed after each chunk, luckily only done 15Hz not 15*64Hz
-      tree_index.addPoints(old_size, new_size - 1);
-      dump_mem_usage();
     }
   }
 }
 
 TaskHandle_t InitTask;
 TaskHandle_t Core0Task;
+TaskHandle_t matchTask;
 TaskHandle_t Core1Task;
 TaskHandle_t SerialLog;
 
@@ -312,7 +244,7 @@ static void calibrator(void * pvParameters) {
   Eigen::Vector3d accM2 = Eigen::Vector3d::Zero();
   Eigen::Vector3d gyroMean = Eigen::Vector3d::Zero();
   Eigen::Vector3d gyroM2 = Eigen::Vector3d::Zero();
-  while((micros() - calibratorStartTime)/1000000.0 < 5.0) { //Repeat Welford's Algorithm to get variances
+  while((micros() - calibratorStartTime)/1000000.0 < 8.0) { //Repeat Welford's Algorithm to get variances
     vTaskDelay(1);
     n++;
     int32_t acc[3];
@@ -338,7 +270,7 @@ static void calibrator(void * pvParameters) {
     "Core0Task",
     32768,
     NULL,
-    2,
+    3,
     &Core0Task,
     0
   );
@@ -349,6 +281,15 @@ static void calibrator(void * pvParameters) {
     NULL,
     3,
     &Core1Task,
+    1
+  );
+  xTaskCreatePinnedToCore(
+    surfaceMatcher,
+    "matchTask",
+    8192,
+    NULL,
+    3,
+    &matchTask,
     1
   );
   xTaskCreatePinnedToCore(
