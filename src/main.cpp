@@ -197,6 +197,11 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::vector<Eigen:
   xSemaphoreGive(distDataMutex);
 }
 
+static Eigen::Vector3f getNorm(const Eigen::Matrix3f& covMatrix) {
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eigenSolver(covMatrix);
+  return eigenSolver.eigenvectors().col(0);
+}
+
 static void surfaceMatcher(void * pvParameters) {
   for(;;) {
     vTaskDelay(1);//for watchdog
@@ -285,9 +290,11 @@ static void surfaceMatcher(void * pvParameters) {
               // Get known information about the two planes
               Eigen::Vector3f currentMean = mean;
               Eigen::Matrix3f currentCov = uncompressCov(currentCovMatrix);
+              Eigen::Vector3f currentNorm = getNorm(currentCov);
               int currentIteration = iteration;
               Eigen::Matrix3f pastMean = {cloud.pts[index].x, cloud.pts[index].y, cloud.pts[index].z};
               Eigen::Matrix3f pastCov = uncompressCov(allCovMatrices[index]);
+              Eigen::Vector3f pastNorm = getNorm(pastCov);
               int pastIteration = iterationPairs[index];
               // TODO: Find if these surfaces appear to describe the same plane
               Eigen::Matrix3f alignmentCov;
