@@ -54,7 +54,6 @@ double pdist[64] = {};
 #define ToF_Sharpness 20
 #define GyroFullScale 500
 #define AccFullScale 8
-#define microsteps 15
 #define USE_ACCELEROMETER true
 
 //Alignment Tweaks
@@ -71,6 +70,15 @@ using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
         >;
 my_kd_tree_t tree_index(3, cloud, max_leaf);
 // Cannot call functions at top level to add points
+
+Eigen::Matrix3f uncompressCov(std::array<float, 6> compressed) {
+  Eigen::Matrix3f Matrix(compressed[0], compressed[1], compressed[2], compressed[1], compressed[3], compressed[4], compressed[2], compressed[4], compressed[5]);
+  return Matrix;
+}
+
+int iteration = 0;
+std::vector<std::array<float, 6>> allCovMatrices; // Includes mean as first 3 floats
+std::vector<int> iterationPairs;
 
 #include <serial_write.h>
 
@@ -157,7 +165,7 @@ static void I2CIntegrator(void * pvParameters) {
   }
 }
 
-static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::Vector3f, 64>& newCloud, std::array<boolean, 64>& hasData) {
+static void interpretDistances(VL53L5CX_ResultsData distData, std::vector<Eigen::Vector3f>& fullCloud) {
   //The ST library returns the data transposed from zone mapping shown in datasheet
   //Pretty-print data with increasing y, decreasing x to reflect reality
   xSemaphoreTake(distDataMutex, portMAX_DELAY);
@@ -175,16 +183,14 @@ static void interpretDistances(VL53L5CX_ResultsData distData, std::array<Eigen::
         double st_ray_dir_x = -std::cos(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         double st_ray_dir_y = std::sin(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         //Point in SENSOR reference frame:
-        newCloud[x+y] = {st_ray_dir_y * dist, st_ray_dir_x * dist, dist};
+        fullCloud.push_back(Eigen::Vector3f({st_ray_dir_y * dist, st_ray_dir_x * dist, dist}));
         /*Point in GLOBAL reference frame:
         xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
         Eigen::Vector3f point_prime = (Orientation * point).cast<float>();
         newCloud[x+y] = {point_prime.x() + float(position[0]), point_prime.y() + float(position[1]), point_prime.z() + float(position[2])}; //Quaternion + position
         xSemaphoreGive(inertialDataMutex);*/
         pdist[x+y] = dist;
-        hasData[x+y] = true;
       } else {
-        hasData[x+y] = false;
       }
     }
   }
@@ -196,25 +202,17 @@ static void surfaceMatcher(void * pvParameters) {
     vTaskDelay(1);//for watchdog
     // Distance Sensor Output (Populating newCloud)
     if (xSemaphoreTake(xCoreSyncSemaphore, portMAX_DELAY) == pdTRUE) { //distData is read by the other core so only 1 core accesses I2C
-      std::array<Eigen::Vector3f, 64> newCloud;
-      std::array<boolean, 64> hasData;
-      interpretDistances(distData, newCloud, hasData);
+      iteration++;
       std::vector<Eigen::Vector3f> fullCloud;
-      int ptCount = 0;
-      for (int i = 0; i < 64; i++) {
-        if (hasData[i]) {
-          ptCount++;
-          fullCloud.push_back(newCloud[i]);
-        }
-      }
+      interpretDistances(distData, fullCloud);
+      int ptCount = fullCloud.size();
       // Turn pointCloud in sensor space into representative planes
       std::vector<Eigen::Vector3f> unitNormals;
-      std::vector<std::array<float, 9>> planeCovMatrices; // Includes mean as first 3 floats
       int n = 0;
       int startCloudSize = cloud.kdtree_get_point_count();
       while (n < 2 * pow(ptCount, 2)) {
         n++;
-        int rand1 = random(0, ptCount-1); // TODO: Check how random() works
+        int rand1 = random(0, ptCount-1);
         int rand2 = random(0, ptCount-2);
         int rand3 = random(0, ptCount-3);
         if (rand2 >= rand1) {rand2++;}
@@ -245,6 +243,7 @@ static void surfaceMatcher(void * pvParameters) {
         }
         int matches = planeMatches.size();
         if (matches >= 12 && !sameNorm) {
+          n = 0;
           Eigen::Vector3f mean;
           Eigen::Matrix3f covariance;
           for (int i = 0; i < matches; ++i) {
@@ -254,11 +253,11 @@ static void surfaceMatcher(void * pvParameters) {
           }
           covariance = covariance/(matches-1);
           //Remove unneccesary data for long-term storage
-          std::array<float, 9> currentCovMatix = {mean[0], mean[1], mean[2], 
-            covariance.row(0)[0], covariance.row(0)[1], covariance.row(0)[2], covariance.row(1)[1], covariance.row(1)[2], covariance.row(2)[2]};
-          planeCovMatrices.push_back(currentCovMatix);
+          std::array<float, 6> currentCovMatrix = {covariance.row(0)[0], covariance.row(0)[1], covariance.row(0)[2], covariance.row(1)[1], covariance.row(1)[2], covariance.row(2)[2]};
+          allCovMatrices.push_back(currentCovMatrix);
+          iterationPairs.push_back(iteration);
           // Add mean to cloud
-          cloud.pts.push_back({mean[0], mean[1], mean[2]});
+          cloud.pts.push_back({mean[0], mean[1], mean[2]}); // TODO: Convert to Absolute
           // A potential pitfall would be repeatedly doing linear least squares until all points are in its scope, so only do it once
           // Remove matched points from fullCloud
           for (int i = 0; i < planeMatches.size(); i++) {
@@ -269,14 +268,33 @@ static void surfaceMatcher(void * pvParameters) {
               serial_write("SOMEHOW OUT OF BOUNDS");
             }
           }
-          n = 0;
           ptCount = fullCloud.size(); // Avoids running fullCloud.size() excessively
+          if (!cloud.pts.empty()) {
+            const float query_pt[3] = {mean[0], mean[1], mean[2]}; // TODO: Convert to Absolute
+            const unsigned int num_results = 50;
+            unsigned int ret_index[num_results];
+            float out_dist_sqr[num_results];
+            nanoflann::KNNResultSet<float> resultSet(num_results);
+            resultSet.init(ret_index, out_dist_sqr);
+
+            tree_index.findNeighbors(resultSet, query_pt);
+            for (const auto& index : ret_index) {
+              // Means and covariances are in the sensor reference frame, not including the sensor's orientation
+              // The difference in the two reference frames must be handled via iteration, from the most recent alignment solution and IMU approx from there
+
+              // Get known information about the two planes
+              Eigen::Vector3f currentMean = mean;
+              Eigen::Matrix3f currentCov = uncompressCov(currentCovMatrix);
+              int currentIteration = iteration;
+              Eigen::Matrix3f pastMean = {cloud.pts[index].x, cloud.pts[index].y, cloud.pts[index].z};
+              Eigen::Matrix3f pastCov = uncompressCov(allCovMatrices[index]);
+              int pastIteration = iterationPairs[index];
+              // TODO: Find if these surfaces appear to describe the same plane
+              Eigen::Matrix3f alignmentCov;
+              // TODO: Write their alignment as a square to minimize
+            }
+          }
         }
-      }
-      if (!cloud.pts.empty()) {
-        
-        // TODO: Find any matching surfaces that appear to be the same surface based on 3D z-score
-        // TODO: Write the alignment of the surfaces using smallest eigenvalue as a square to minimize
       }
       // Add points in the cloud to the kd index
       int endCloudSize = cloud.kdtree_get_point_count();
@@ -286,7 +304,6 @@ static void surfaceMatcher(void * pvParameters) {
     }
   }
 }
-      
 
 static void aligner(void * pvParameters) {
   for(;;) {
@@ -304,7 +321,8 @@ static void aligner(void * pvParameters) {
         Eigen::VectorXd x_opt = Eigen::pseudoInverse(A)*b;
       }
     }
-  }
+  }              // TODO: Find if these surfaces appear to describe the same plane
+
 }
 
 // INITIALIZATION CODE
@@ -389,7 +407,7 @@ void setup() {
 
   // Initialize serial for output.
   Serial.begin(115200);
-  delay(50);
+  delay(20);
   while (!Serial) {
     delay(10);
   }
