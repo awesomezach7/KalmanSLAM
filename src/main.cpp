@@ -143,22 +143,110 @@ static void imuIntegrator(Eigen::Vector3d accOffset, Eigen::Vector3d accVari, Ei
   }
 }
 
-static std::vector<Eigen::Vector3f> interpretDistances(VL53L5CX_ResultsData distData) {
-  std::vector<Eigen::Vector3f> localCloud;
+struct ptWithDeviation {
+  Eigen::Vector3f vec;
+  double deviation;
+};
+
+#define MMtoM 0.001
+
+static std::vector<ptWithDeviation> interpretDistances(VL53L5CX_ResultsData distData) {
+  std::vector<ptWithDeviation> localCloud;
   for (int y = 0 ; y <= ToFWidth * (ToFWidth - 1) ; y += ToFWidth) {
     for (int x = ToFWidth - 1 ; x >= 0 ; x--) {
-      double distMeters = distData.distance_mm[x + y]/1000.0;
+      double distMeters = distData.distance_mm[x + y] * MMtoM;
       if (pdist[x+y] != distMeters && distMeters != 0) {
         double pitch_rad = ST_PITCH_ANGLES_DEG[63-(x+y)] * DEG_TO_RAD;
         double yaw_rad = ST_YAW_ANGLES_DEG[63-(x+y)] * DEG_TO_RAD;
         double st_ray_dir_x = -std::cos(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
         double st_ray_dir_y = std::sin(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
-        localCloud.push_back(Eigen::Vector3f({static_cast<float>(st_ray_dir_y * distMeters), static_cast<float>(st_ray_dir_x * distMeters), static_cast<float>(distMeters)}));
+        ptWithDeviation point;
+        point.vec = Eigen::Vector3f({static_cast<float>(st_ray_dir_y * distMeters), static_cast<float>(st_ray_dir_x * distMeters), static_cast<float>(distMeters)});
+        point.deviation = distData.range_sigma_mm[x+y] * MMtoM;
+        localCloud.push_back(point);
         pdist[x+y] = distMeters;
       }
     }
   }
   return localCloud;
+}
+
+static std::array<std::uniform_int_distribution<int>, 3> makeIntDistros(int ptCount) {
+  std::uniform_int_distribution<int> distribOne(0, ptCount-1);
+  std::uniform_int_distribution<int> distribTwo(0, ptCount-2);
+  std::uniform_int_distribution<int> distribThree(0, ptCount-3);
+  return {distribOne, distribTwo, distribThree};
+}
+
+static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distributions, std::mt19937 gen, std::vector<ptWithDeviation>& localCloud, int ptCount) {
+  std::vector<Eigen::Vector3f> randPts;
+  std::vector<int> rands;
+  for (auto& dist : distributions) {
+    int rand = dist(gen);
+    for (const auto& prevRand : rands) {
+      rand += int(rand >= prevRand);
+    }
+    randPts.push_back(localCloud[rand].vec);
+  }
+  Eigen::Vector3f unitNormal = (randPts[0]-randPts[1]).cross(randPts[0]-randPts[2]).normalized();
+
+  std::vector<int> planeMatches;
+  for (int i = 0; i < ptCount; i++) {
+    float normDist = (localCloud[i].vec-randPts[0]).dot(unitNormal);
+    if (normDist < point_plane_max_stdevs * localCloud[i].deviation) {
+      planeMatches.push_back(i);
+    }
+  }
+  int matches = planeMatches.size();
+  if (matches >= 12) {
+    Eigen::Vector3f mean;
+    Eigen::Matrix3f covariance;
+    for (int i = 0; i < matches; ++i) {
+      Eigen::Vector3f diff = localCloud[planeMatches[i]].vec - mean;
+      mean += diff / (i + 1);
+      covariance += diff * diff.transpose() * i / (i + 1);
+    }
+    covariance = covariance/(matches-1);
+    plane newPlane;
+    newPlane.covariances = compressCov(covariance);
+    newPlane.mean = mean;
+    newPlane.iteration = iteration;
+    cloud.pts.push_back({newPlane.mean[0], newPlane.mean[1], newPlane.mean[2]}); // TODO: Convert to Absolute
+    std::sort(planeMatches.rbegin(), planeMatches.rend());
+    for (int index : planeMatches) {
+      if (index < localCloud.size()) {
+        localCloud.erase(localCloud.begin() + index);
+      }
+    }
+    return newPlane;
+  }
+}
+
+#define CLOSE_PLANE_COUNT 20
+static void constrainByPlane(plane newPlane) {
+  if (!cloud.pts.empty()) {
+    const float query_pt[3] = {newPlane.mean[0], newPlane.mean[1], newPlane.mean[2]}; // TODO: Convert to Absolute
+    unsigned int ret_index[CLOSE_PLANE_COUNT];
+    float out_dist_sqr[CLOSE_PLANE_COUNT];
+    nanoflann::KNNResultSet<float> resultSet(CLOSE_PLANE_COUNT);
+    resultSet.init(ret_index, out_dist_sqr);
+
+    tree_index.findNeighbors(resultSet, query_pt);
+    for (const auto& index : ret_index) {
+      Eigen::Vector3f currentMean = newPlane.mean;
+      Eigen::Matrix3f currentCov = uncompressCov(newPlane.covariances);
+      Eigen::Vector3f currentNorm = getNorm(currentCov);
+      int currentIteration = iteration;
+      plane pastPlane = allPlanes[index];
+      Eigen::Vector3f pastMean = pastPlane.mean;
+      Eigen::Matrix3f pastCov = uncompressCov(pastPlane.covariances);
+      Eigen::Vector3f pastNorm = getNorm(pastCov);
+      int pastIteration = pastPlane.iteration;
+      // TODO: Find if these surfaces appear to describe the same plane
+      Eigen::Matrix3f alignmentCov;
+      // TODO: Write their alignment as a square to minimize
+    }
+  }
 }
 
 static void runMatching() {
@@ -173,96 +261,22 @@ static void runMatching() {
     return;
   }
   iteration++;
-  std::vector<Eigen::Vector3f> localCloud = interpretDistances(distData);
+  std::vector<ptWithDeviation> localCloud = interpretDistances(distData);
   int ptCount = localCloud.size();
   std::vector<Eigen::Vector3f> unitNormals;
   int n = 0;
   int startCloudSize = cloud.kdtree_get_point_count();
   std::random_device randDevice;
   std::mt19937 gen(randDevice());
+  std::array<std::uniform_int_distribution<int>, 3> distributions = makeIntDistros(ptCount);
+  std::vector<Eigen::Vector3f> unitNormals;
   while (n < 2 * pow(ptCount, 2)) {
     n++;
-    std::uniform_int_distribution<int> distribOne(0, ptCount-1);
-    std::uniform_int_distribution<int> distribTwo(0, ptCount-2);
-    std::uniform_int_distribution<int> distribThree(0, ptCount-3);
-    int rand1 = distribOne(gen);
-    int rand2 = distribTwo(gen);
-    int rand3 = distribThree(gen);
-    if (rand2 >= rand1) {rand2++;}
-    if (rand3 >= rand1) {rand3++;}
-    if (rand3 >= rand2) {rand3++;}
-    Eigen::Vector3f pt1 = localCloud[rand1];
-    Eigen::Vector3f pt2 = localCloud[rand2];
-    Eigen::Vector3f pt3 = localCloud[rand3];
-    Eigen::Vector3f unitNormal = (pt1-pt2).cross(pt1-pt3).normalized();
-
-    std::vector<int> planeMatches;
-    for (int i = 0; i < ptCount; i++) {
-      float normDist = (localCloud[i]-pt1).dot(unitNormal);
-      if (normDist < point_plane_max_stdevs * distData.range_sigma_mm[i]/1000.0) { // TODO: Make sure the stdevs are right as the i values are mixed up
-        planeMatches.push_back(i);
-      }
-    }
-    bool sameNorm = false;
-    for (int i = 0; i < unitNormals.size(); i++) {
-      if (unitNormal.dot(unitNormals[i]) < cos(PI / 9)) { //Within 10 degrees
-        sameNorm = true;
-      }
-    }
-    int matches = planeMatches.size();
-    if (matches >= 12 && !sameNorm) {
-      n = 0;
-      Eigen::Vector3f mean;
-      Eigen::Matrix3f covariance;
-      for (int i = 0; i < matches; ++i) {
-        Eigen::Vector3f diff = localCloud[planeMatches[i]] - mean;
-        mean += diff / (i + 1);
-        covariance += diff * diff.transpose() * i / (i + 1);
-      }
-      covariance = covariance/(matches-1);
-      plane newPlane;
-      newPlane.covariances = compressCov(covariance);
-      newPlane.mean = mean;
-      newPlane.iteration = iteration;
-      allPlanes.push_back(newPlane);
-      cloud.pts.push_back({mean[0], mean[1], mean[2]}); // TODO: Convert to Absolute
-      for (int i = 0; i < planeMatches.size(); i++) {
-        if (i < localCloud.size()) {
-          localCloud.erase(localCloud.begin() + planeMatches[i]);
-        } else {
-          serial_write("SOMEHOW OUT OF BOUNDS");
-        }
-      }
-      ptCount = localCloud.size();
-      if (!cloud.pts.empty()) {
-        const float query_pt[3] = {mean[0], mean[1], mean[2]}; // TODO: Convert to Absolute
-        const unsigned int num_results = 50;
-        unsigned int ret_index[num_results];
-        float out_dist_sqr[num_results];
-        nanoflann::KNNResultSet<float> resultSet(num_results);
-        resultSet.init(ret_index, out_dist_sqr);
-
-        tree_index.findNeighbors(resultSet, query_pt);
-        for (const auto& index : ret_index) {
-          // Means and covariances are in the sensor reference frame, not including the sensor's orientation
-          // The difference in the two reference frames must be handled via iteration, from the most recent alignment solution and IMU approx from there
-
-          // Get known information about the two planes
-          Eigen::Vector3f currentMean = mean;
-          Eigen::Matrix3f currentCov = covariance;
-          Eigen::Vector3f currentNorm = getNorm(currentCov);
-          int currentIteration = iteration;
-          plane pastPlane = allPlanes[index];
-          Eigen::Vector3f pastMean = pastPlane.mean;
-          Eigen::Matrix3f pastCov = uncompressCov(pastPlane.covariances);
-          Eigen::Vector3f pastNorm = getNorm(pastCov);
-          int pastIteration = pastPlane.iteration;
-          // TODO: Find if these surfaces appear to describe the same plane
-          Eigen::Matrix3f alignmentCov;
-          // TODO: Write their alignment as a square to minimize
-        }
-      }
-    }
+    plane newPlane = runRANSAC(distributions, gen, localCloud, ptCount); // TODO: use std::optional
+    allPlanes.push_back(newPlane);
+    ptCount = localCloud.size();
+    distributions = makeIntDistros(ptCount);
+    constrainByPlane(newPlane);
   }
   int endCloudSize = cloud.kdtree_get_point_count();
   if (endCloudSize != startCloudSize) {
@@ -296,7 +310,6 @@ static void aligner(void * pvParameters) {
 
 // INITIALIZATION CODE
 
-TaskHandle_t InitTask;
 TaskHandle_t Core0Task;
 TaskHandle_t matchTask;
 TaskHandle_t Core1Task;
@@ -309,7 +322,7 @@ static void calibrator(void * pvParameters) {
   Eigen::Vector3d accM2 = Eigen::Vector3d::Zero();
   Eigen::Vector3d gyroMean = {342.2, -448.3, -790.0};
   Eigen::Vector3d gyroM2 = Eigen::Vector3d::Zero();
-  while((micros() - calibratorStartTime)/1000000.0 < 8.0) { //Repeat Welford's Algorithm to get variances
+  while((micros() - calibratorStartTime)/1000000.0 < 8.0) {
     vTaskDelay(watchdog_delay);
     n++;
     int32_t acc[3];
@@ -403,7 +416,7 @@ void setup() {
     8192,
     NULL,
     2,
-    &InitTask,
+    &Core1Task,
     0
   );
 }
