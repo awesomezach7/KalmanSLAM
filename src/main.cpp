@@ -1,3 +1,15 @@
+//TWEAKABLE PARAMETERS
+
+#define ToF_Sharpness 20
+#define GyroFullScale 500
+#define AccFullScale 8
+#define USE_ACCELEROMETER true
+
+#define max_leaf 12
+#define point_plane_max_stdevs 2
+#define filter_stdevs 2
+#define DO_ALIGN false
+
 //GLOBALS AND LIBRARIES
 
 #include <nanoflann.hpp>
@@ -6,13 +18,19 @@
 #include <random>
 #include <ArduinoEigen.h>
 
-#include "FreeRTOS.h"
-#include "task.h"
-#include "semphr.h"
 #define watchdog_delay pdMS_TO_TICKS(1)
 
 static SemaphoreHandle_t inertialDataMutex;
 static SemaphoreHandle_t i2cMutex;
+
+#include <serial_write.h>
+
+#include <utils.h>
+PointCloud<float> cloud;
+using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
+        nanoflann::L2_Simple_Adaptor<float, PointCloud<float>>, PointCloud<float>, 3 /* dim */
+        >;
+my_kd_tree_t tree_index(3, cloud, max_leaf);
 
 #include <LSM6DSO32Sensor.h>
 
@@ -49,30 +67,15 @@ constexpr double ST_YAW_ANGLES_DEG[64] = {
 
 double pdist[64] = {};
 
-#define ToF_Sharpness 20
-#define GyroFullScale 500
-#define AccFullScale 8
-#define USE_ACCELEROMETER true
-
-#define max_leaf 12
-#define point_plane_max_stdevs 2
-#define filter_stdevs 2
-#define DO_ALIGN false
-
-#include <utils.h>
-PointCloud<float> cloud;
-using my_kd_tree_t = nanoflann::KDTreeSingleIndexDynamicAdaptor<
-        nanoflann::L2_Simple_Adaptor<float, PointCloud<float>>, PointCloud<float>, 3 /* dim */
-        >;
-my_kd_tree_t tree_index(3, cloud, max_leaf);
-
-Eigen::Matrix3f uncompressCov(std::array<float, 6> compressed) {
-  float terms[9] = {compressed[0], compressed[1], compressed[2], compressed[1], compressed[3], compressed[4], compressed[2], compressed[4], compressed[5]};
+Eigen::Matrix3f decompressCov(std::array<float, 6> compressed) {
+  float terms[9] = {
+    compressed[0], compressed[1], compressed[2], 
+    compressed[1], compressed[3], compressed[4],
+    compressed[2], compressed[4], compressed[5]};
   return Eigen::Map<Eigen::Matrix3f>(terms);
 }
 std::array<float, 6> compressCov(Eigen::Matrix3f uncompressed) {
-  std::array<float, 6> compressionArray = {uncompressed(0, 0), uncompressed(0, 1), uncompressed(0, 2), uncompressed(1, 1), uncompressed(1, 2), uncompressed(2, 2)};
-  return compressionArray;
+  return {uncompressed(0, 0), uncompressed(0, 1), uncompressed(0, 2), uncompressed(1, 1), uncompressed(1, 2), uncompressed(2, 2)};
 }
 static Eigen::Vector3f getNorm(const Eigen::Matrix3f& covMatrix) {
   Eigen::JacobiSVD<Eigen::Matrix3f> svd(covMatrix, Eigen::ComputeThinU | Eigen::ComputeThinV);
@@ -86,8 +89,6 @@ struct plane{
 
 int iteration = 0;
 std::vector<plane> allPlanes;
-
-#include <serial_write.h>
 
 Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
 Eigen::Vector3d prevPosition(0.0, 0.0, 0.0);
@@ -112,11 +113,13 @@ static void imuIntegrator(Eigen::Vector3d accOffset, Eigen::Vector3d accVari, Ei
     xSemaphoreTake(i2cMutex, portMAX_DELAY);
     AccGyr.Get_G_Axes(gyro);
     xSemaphoreGive(i2cMutex);
-    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>() + gyroOffset;
+    Eigen::Vector3d gyroscope = {static_cast<double>(gyro[0]), static_cast<double>(gyro[1]), static_cast<double>(gyro[2])};
+    gyroscope += gyroOffset;
     double radConvert = elapsedTimeSeconds * (0.001) * (PI/180.0);
     Eigen::Vector3d dAngleHalf = gyroscope * radConvert * (0.5);
     xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
-    Orientation *= Eigen::Quaterniond(cos(dAngleHalf.norm()), sin(dAngleHalf[0]), sin(dAngleHalf[1]), sin(dAngleHalf[2]));
+    Orientation *= Eigen::Quaterniond(cos(dAngleHalf.norm()), sin(dAngleHalf[0]), 
+                                      sin(dAngleHalf[1]), sin(dAngleHalf[2]));
     Orientation.normalize();
     xSemaphoreGive(inertialDataMutex);
 
@@ -124,14 +127,13 @@ static void imuIntegrator(Eigen::Vector3d accOffset, Eigen::Vector3d accVari, Ei
     xSemaphoreTake(i2cMutex, portMAX_DELAY);
     AccGyr.Get_X_Axes(acc);
     xSemaphoreGive(i2cMutex);
-    Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>() + accOffset) * gravAccel/1000;
+    Eigen::Vector3d accelerometer = {static_cast<double>(acc[0]), static_cast<double>(acc[1]), static_cast<double>(acc[2])};
+    accelerometer = (accelerometer + accOffset) * gravAccel/1000;
     xSemaphoreTake(inertialDataMutex, portMAX_DELAY);
     Eigen::Vector3d trueAccel(Orientation * accelerometer);
     trueAccel[2] -= gravAccel;
     velocity += trueAccel * elapsedTimeSeconds;
     position += velocity * elapsedTimeSeconds;
-    
-    xSemaphoreGive(inertialDataMutex);
 
     std::vector<float> inertialUpdateData = {
       static_cast<float>(Orientation.w()), static_cast<float>(Orientation.x()), static_cast<float>(Orientation.y()), static_cast<float>(Orientation.z()),
@@ -139,6 +141,7 @@ static void imuIntegrator(Eigen::Vector3d accOffset, Eigen::Vector3d accVari, Ei
       static_cast<float>(velocity[0]), static_cast<float>(velocity[1]), static_cast<float>(velocity[2]),
       static_cast<float>(elapsedTimeSeconds * 1000.0)
     };
+    xSemaphoreGive(inertialDataMutex);
     serial_write("inertialUpdate: ", inertialUpdateData);
   }
 }
@@ -150,6 +153,7 @@ struct ptWithDeviation {
 
 #define MMtoM 0.001
 
+// From [todo]
 static std::vector<ptWithDeviation> interpretDistances(VL53L5CX_ResultsData distData) {
   std::vector<ptWithDeviation> localCloud;
   for (int y = 0 ; y <= ToFWidth * (ToFWidth - 1) ; y += ToFWidth) {
@@ -178,7 +182,9 @@ static std::array<std::uniform_int_distribution<int>, 3> makeIntDistros(int ptCo
   return {distribOne, distribTwo, distribThree};
 }
 
-static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distributions, std::mt19937 gen, std::vector<ptWithDeviation>& localCloud, int ptCount) {
+#include <optional>
+static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distributions, std::mt19937 gen, 
+                       std::vector<ptWithDeviation>& localCloud, int ptCount) {
   std::vector<Eigen::Vector3f> randPts;
   std::vector<int> rands;
   for (auto& dist : distributions) {
@@ -192,7 +198,7 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
 
   std::vector<int> planeMatches;
   for (int i = 0; i < ptCount; i++) {
-    float normDist = (localCloud[i].vec-randPts[0]).dot(unitNormal);
+    float normDist = std::abs((localCloud[i].vec-randPts[0]).dot(unitNormal));
     if (normDist < point_plane_max_stdevs * localCloud[i].deviation) {
       planeMatches.push_back(i);
     }
@@ -212,7 +218,7 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
     newPlane.mean = mean;
     newPlane.iteration = iteration;
     cloud.pts.push_back({newPlane.mean[0], newPlane.mean[1], newPlane.mean[2]}); // TODO: Convert to Absolute
-    std::sort(planeMatches.rbegin(), planeMatches.rend());
+    std::sort(planeMatches.rbegin(), planeMatches.rend()); // TODO: double check it works
     for (int index : planeMatches) {
       if (index < localCloud.size()) {
         localCloud.erase(localCloud.begin() + index);
@@ -220,6 +226,9 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
     }
     return newPlane;
   }
+  plane newPlane;
+  newPlane.iteration = -1;
+  return newPlane;
 }
 
 #define CLOSE_PLANE_COUNT 20
@@ -234,12 +243,12 @@ static void constrainByPlane(plane newPlane) {
     tree_index.findNeighbors(resultSet, query_pt);
     for (const auto& index : ret_index) {
       Eigen::Vector3f currentMean = newPlane.mean;
-      Eigen::Matrix3f currentCov = uncompressCov(newPlane.covariances);
+      Eigen::Matrix3f currentCov = decompressCov(newPlane.covariances);
       Eigen::Vector3f currentNorm = getNorm(currentCov);
       int currentIteration = iteration;
       plane pastPlane = allPlanes[index];
       Eigen::Vector3f pastMean = pastPlane.mean;
-      Eigen::Matrix3f pastCov = uncompressCov(pastPlane.covariances);
+      Eigen::Matrix3f pastCov = decompressCov(pastPlane.covariances);
       Eigen::Vector3f pastNorm = getNorm(pastCov);
       int pastIteration = pastPlane.iteration;
       // TODO: Find if these surfaces appear to describe the same plane
@@ -263,20 +272,20 @@ static void runMatching() {
   iteration++;
   std::vector<ptWithDeviation> localCloud = interpretDistances(distData);
   int ptCount = localCloud.size();
-  std::vector<Eigen::Vector3f> unitNormals;
   int n = 0;
   int startCloudSize = cloud.kdtree_get_point_count();
   std::random_device randDevice;
   std::mt19937 gen(randDevice());
   std::array<std::uniform_int_distribution<int>, 3> distributions = makeIntDistros(ptCount);
-  std::vector<Eigen::Vector3f> unitNormals;
   while (n < 2 * pow(ptCount, 2)) {
     n++;
-    plane newPlane = runRANSAC(distributions, gen, localCloud, ptCount); // TODO: use std::optional
-    allPlanes.push_back(newPlane);
-    ptCount = localCloud.size();
-    distributions = makeIntDistros(ptCount);
-    constrainByPlane(newPlane);
+    plane newPlane = runRANSAC(distributions, gen, localCloud, ptCount);
+    if (newPlane.iteration != -1) {
+      allPlanes.push_back(newPlane);
+      ptCount = localCloud.size();
+      distributions = makeIntDistros(ptCount);
+      constrainByPlane(newPlane);
+    }
   }
   int endCloudSize = cloud.kdtree_get_point_count();
   if (endCloudSize != startCloudSize) {
@@ -315,26 +324,27 @@ TaskHandle_t matchTask;
 TaskHandle_t Core1Task;
 TaskHandle_t SerialLog;
 
-static void calibrator(void * pvParameters) {
+#define gravMilliGs 1000.0
+static void imuCalibrator(void * pvParameters) {
   unsigned long calibratorStartTime = micros();
   int n = 0;
-  Eigen::Vector3d accMean = {-15.83, 29.63, 37.28};
+  Eigen::Vector3d accMean = Eigen::Vector3d::Zero();
+  Eigen::Vector3d gyroMean = Eigen::Vector3d::Zero();
   Eigen::Vector3d accM2 = Eigen::Vector3d::Zero();
-  Eigen::Vector3d gyroMean = {342.2, -448.3, -790.0};
   Eigen::Vector3d gyroM2 = Eigen::Vector3d::Zero();
   while((micros() - calibratorStartTime)/1000000.0 < 8.0) {
     vTaskDelay(watchdog_delay);
     n++;
     int32_t acc[3];
     AccGyr.Get_X_Axes(acc);
-    Eigen::Vector3d accelerometer = (Eigen::Map<Eigen::Vector3i>(acc).cast<double>());
-    accelerometer[2] -= 1000;
+    Eigen::Vector3d accelerometer = {static_cast<double>(acc[0]), static_cast<double>(acc[1]), static_cast<double>(acc[2])};
+    accelerometer[2] -= gravMilliGs;
     Eigen::Vector3d accDelta = accelerometer - accMean;
     accMean += accDelta / n;
     accM2 += (accelerometer - accMean).cwiseProduct(accDelta);
     int32_t gyro[3];
     AccGyr.Get_G_Axes(gyro);
-    Eigen::Vector3d gyroscope = Eigen::Map<Eigen::Vector3i>(gyro).cast<double>();
+    Eigen::Vector3d gyroscope = {static_cast<double>(gyro[0]), static_cast<double>(gyro[1]), static_cast<double>(gyro[2])};
     Eigen::Vector3d gyroDelta = gyroscope - gyroMean;
     gyroMean += gyroDelta / n;
     gyroM2 += (gyroscope - gyroMean).cwiseProduct(gyroDelta);
@@ -370,7 +380,7 @@ static void calibrator(void * pvParameters) {
     &SerialLog,
     1
   );
-  imuIntegrator(accOffset, accVari, gyroOffset, gyroVari);
+  return imuIntegrator(accOffset, accVari, gyroOffset, gyroVari);
 }
 
 void setup() {
@@ -411,7 +421,7 @@ void setup() {
   i2cMutex = xSemaphoreCreateMutex();
   
   xTaskCreatePinnedToCore(
-    calibrator,
+    imuCalibrator,
     "InitTask",
     8192,
     NULL,
