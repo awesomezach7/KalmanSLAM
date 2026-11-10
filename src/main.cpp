@@ -194,8 +194,8 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
     }
     covariance = covariance/(matches-1);
     plane newPlane(covariance, mean, iteration);
-    cloud.append(newPlane.getMean()); // TODO: Convert to Absolute
-    std::sort(planeMatches.rbegin(), planeMatches.rend()); // TODO: check if this section of code is valid
+    cloud.append(newPlane.getMean() + position);
+    std::sort(planeMatches.rbegin(), planeMatches.rend());
     for (int index : planeMatches) {
       if (index < localCloud.size()) {
         localCloud.erase(localCloud.begin() + index);
@@ -210,7 +210,8 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
 #define CLOSE_PLANE_COUNT 20
 static void constrainByPlane(plane newPlane) {
   if (!cloud.pts.empty()) {
-    const float query_pt[3] = {newPlane.getMean()[0], newPlane.getMean()[1], newPlane.getMean()[2]}; // TODO: Convert to Absolute
+    Eigen::Vector3f absPoint = newPlane.getMean() + position;
+    const float query_pt[3] = {absPoint.x(), absPoint.y(), absPoint.z()};
     unsigned int ret_index[CLOSE_PLANE_COUNT];
     float out_dist_sqr[CLOSE_PLANE_COUNT];
     nanoflann::KNNResultSet<float> resultSet(CLOSE_PLANE_COUNT);
@@ -218,18 +219,8 @@ static void constrainByPlane(plane newPlane) {
 
     tree_index.findNeighbors(resultSet, query_pt);
     for (const auto& index : ret_index) {
-      Eigen::Vector3f currentMean = newPlane.getMean();
-      Eigen::Matrix3f currentCov = newPlane.getCov();
-      Eigen::Vector3f currentNorm = newPlane.getNorm();
-      int currentIteration = iteration;
       plane pastPlane = allPlanes[index];
-      Eigen::Vector3f pastMean = pastPlane.getMean();
-      Eigen::Matrix3f pastCov = pastPlane.getCov();
-      Eigen::Vector3f pastNorm = pastPlane.getNorm();
-      int pastIteration = pastPlane.getIteration();
-      // TODO: Find if these surfaces appear to describe the same plane
-      Eigen::Matrix3f alignmentCov;
-      // TODO: Write their alignment as a square to minimize
+      
     }
   }
 }
