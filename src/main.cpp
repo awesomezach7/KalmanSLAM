@@ -67,25 +67,7 @@ constexpr double ST_YAW_ANGLES_DEG[64] = {
 
 double pdist[64] = {};
 
-Eigen::Matrix3f decompressCov(std::array<float, 6> compressed) {
-  float terms[9] = {
-    compressed[0], compressed[1], compressed[2], 
-    compressed[1], compressed[3], compressed[4],
-    compressed[2], compressed[4], compressed[5]};
-  return Eigen::Map<Eigen::Matrix3f>(terms);
-}
-std::array<float, 6> compressCov(Eigen::Matrix3f uncompressed) {
-  return {uncompressed(0, 0), uncompressed(0, 1), uncompressed(0, 2), uncompressed(1, 1), uncompressed(1, 2), uncompressed(2, 2)};
-}
-static Eigen::Vector3f getNorm(const Eigen::Matrix3f& covMatrix) {
-  Eigen::JacobiSVD<Eigen::Matrix3f> svd(covMatrix, Eigen::ComputeThinU | Eigen::ComputeThinV);
-  return svd.matrixU().col(2);
-}
-struct plane{
-  std::array<float, 6> covariances;
-  Eigen::Vector3f mean;
-  int iteration;
-};
+#include <plane.h>
 
 int iteration = 0;
 std::vector<plane> allPlanes;
@@ -211,11 +193,8 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
       covariance += diff * diff.transpose() * i / (i + 1);
     }
     covariance = covariance/(matches-1);
-    plane newPlane;
-    newPlane.covariances = compressCov(covariance);
-    newPlane.mean = mean;
-    newPlane.iteration = iteration;
-    cloud.pts.push_back({newPlane.mean[0], newPlane.mean[1], newPlane.mean[2]}); // TODO: Convert to Absolute
+    plane newPlane(covariance, mean, iteration);
+    cloud.append(newPlane.getMean()); // TODO: Convert to Absolute
     std::sort(planeMatches.rbegin(), planeMatches.rend()); // TODO: check if this section of code is valid
     for (int index : planeMatches) {
       if (index < localCloud.size()) {
@@ -224,15 +203,14 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
     }
     return newPlane;
   }
-  plane newPlane;
-  newPlane.iteration = -1;
+  plane newPlane (Eigen::Matrix3f::Zero(), Eigen::Vector3f::Zero(), -1);
   return newPlane;
 }
 
 #define CLOSE_PLANE_COUNT 20
 static void constrainByPlane(plane newPlane) {
   if (!cloud.pts.empty()) {
-    const float query_pt[3] = {newPlane.mean[0], newPlane.mean[1], newPlane.mean[2]}; // TODO: Convert to Absolute
+    const float query_pt[3] = {newPlane.getMean()[0], newPlane.getMean()[1], newPlane.getMean()[2]}; // TODO: Convert to Absolute
     unsigned int ret_index[CLOSE_PLANE_COUNT];
     float out_dist_sqr[CLOSE_PLANE_COUNT];
     nanoflann::KNNResultSet<float> resultSet(CLOSE_PLANE_COUNT);
@@ -240,15 +218,15 @@ static void constrainByPlane(plane newPlane) {
 
     tree_index.findNeighbors(resultSet, query_pt);
     for (const auto& index : ret_index) {
-      Eigen::Vector3f currentMean = newPlane.mean;
-      Eigen::Matrix3f currentCov = decompressCov(newPlane.covariances);
-      Eigen::Vector3f currentNorm = getNorm(currentCov);
+      Eigen::Vector3f currentMean = newPlane.getMean();
+      Eigen::Matrix3f currentCov = newPlane.getCov();
+      Eigen::Vector3f currentNorm = newPlane.getNorm();
       int currentIteration = iteration;
       plane pastPlane = allPlanes[index];
-      Eigen::Vector3f pastMean = pastPlane.mean;
-      Eigen::Matrix3f pastCov = decompressCov(pastPlane.covariances);
-      Eigen::Vector3f pastNorm = getNorm(pastCov);
-      int pastIteration = pastPlane.iteration;
+      Eigen::Vector3f pastMean = pastPlane.getMean();
+      Eigen::Matrix3f pastCov = pastPlane.getCov();
+      Eigen::Vector3f pastNorm = pastPlane.getNorm();
+      int pastIteration = pastPlane.getIteration();
       // TODO: Find if these surfaces appear to describe the same plane
       Eigen::Matrix3f alignmentCov;
       // TODO: Write their alignment as a square to minimize
@@ -278,7 +256,7 @@ static void runMatching() {
   while (n < 2 * pow(ptCount, 2)) {
     n++;
     plane newPlane = runRANSAC(distributions, gen, localCloud, ptCount);
-    if (newPlane.iteration != -1) {
+    if (newPlane.getIteration() != -1) {
       n = 0;
       allPlanes.push_back(newPlane);
       ptCount = localCloud.size();
