@@ -159,7 +159,7 @@ static std::vector<ptWithDeviation> interpretDistances(VL53L5CX_ResultsData dist
   for (int y = 0 ; y <= ToFWidth * (ToFWidth - 1) ; y += ToFWidth) {
     for (int x = ToFWidth - 1 ; x >= 0 ; x--) {
       double distMeters = distData.distance_mm[x + y] * MMtoM;
-      if (pdist[x+y] != distMeters && distMeters != 0) {
+      if (pdist[x+y] != distMeters && distMeters != 0 && (distData.target_status[x+y] == 5 || distData.target_status[x+y] == 9)) {
         double pitch_rad = ST_PITCH_ANGLES_DEG[63-(x+y)] * DEG_TO_RAD;
         double yaw_rad = ST_YAW_ANGLES_DEG[63-(x+y)] * DEG_TO_RAD;
         double st_ray_dir_x = -std::cos(yaw_rad) * std::cos(pitch_rad) / std::sin(pitch_rad);
@@ -182,9 +182,7 @@ static std::array<std::uniform_int_distribution<int>, 3> makeIntDistros(int ptCo
   return {distribOne, distribTwo, distribThree};
 }
 
-#include <optional>
-static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distributions, std::mt19937 gen, 
-                       std::vector<ptWithDeviation>& localCloud, int ptCount) {
+static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distributions, std::mt19937 gen, std::vector<ptWithDeviation>& localCloud, int ptCount) {
   std::vector<Eigen::Vector3f> randPts;
   std::vector<int> rands;
   for (auto& dist : distributions) {
@@ -218,7 +216,7 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
     newPlane.mean = mean;
     newPlane.iteration = iteration;
     cloud.pts.push_back({newPlane.mean[0], newPlane.mean[1], newPlane.mean[2]}); // TODO: Convert to Absolute
-    std::sort(planeMatches.rbegin(), planeMatches.rend()); // TODO: double check it works
+    std::sort(planeMatches.rbegin(), planeMatches.rend()); // TODO: check if this section of code is valid
     for (int index : planeMatches) {
       if (index < localCloud.size()) {
         localCloud.erase(localCloud.begin() + index);
@@ -281,6 +279,7 @@ static void runMatching() {
     n++;
     plane newPlane = runRANSAC(distributions, gen, localCloud, ptCount);
     if (newPlane.iteration != -1) {
+      n = 0;
       allPlanes.push_back(newPlane);
       ptCount = localCloud.size();
       distributions = makeIntDistros(ptCount);
