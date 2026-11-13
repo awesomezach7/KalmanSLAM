@@ -72,9 +72,18 @@ double pdist[64] = {};
 int iteration = 0;
 std::vector<plane> allPlanes;
 
+std::vector<Eigen::Vector3f> path;
+std::vector<Eigen::Quaternionf> orientPath;
+
 Eigen::Quaterniond Orientation(1.0, 0.0, 0.0, 0.0);
-Eigen::Vector3d prevPosition(0.0, 0.0, 0.0);
 Eigen::Vector3d position(0.0, 0.0, 0.0);
+
+//#include <constraint.h>
+//std::vector<constraint> constraintList;
+
+/*static void makeIMUConstraint() {
+
+}*/
 
 static void imuIntegrator(Eigen::Vector3d accOffset, Eigen::Vector3d accVari, Eigen::Vector3d gyroOffset, Eigen::Vector3d gyroVari) {
   unsigned long startTime = micros();
@@ -135,7 +144,7 @@ struct ptWithDeviation {
 
 #define MMtoM 0.001
 
-// From [todo]
+// Very adapted from https://github.com/ferrolho/VL53L5CX-BNO08X-viewer/
 static std::vector<ptWithDeviation> interpretDistances(VL53L5CX_ResultsData distData) {
   std::vector<ptWithDeviation> localCloud;
   for (int y = 0 ; y <= ToFWidth * (ToFWidth - 1) ; y += ToFWidth) {
@@ -207,11 +216,31 @@ static plane runRANSAC(std::array<std::uniform_int_distribution<int>, 3> distrib
   return newPlane;
 }
 
-#define CLOSE_PLANE_COUNT 20
-static void constrainByPlane(plane newPlane) {
+/*static void makePlaneConstraint(plane pastPlaneGlobal, plane newPlaneGlobal) {
+
+}*/
+
+#define MAX_STDEVS 2
+static boolean doConstrain(plane pastPlaneGlobal, plane newPlaneGlobal) {
+  float dAngleRad = std::acos(std::abs(pastPlaneGlobal.getUnitNorm().dot(newPlaneGlobal.getUnitNorm())));
+  if (dAngleRad >= HALF_PI) { //Quarters the possibilities immediately with low compute
+    return false;
+  }
+  Eigen::Matrix<float, 6, 6> fullCovariances;
+  Eigen::Vector<float, 6> mean;
+}
+
+static plane applySensorPos(plane inputPlane) {
+  Eigen::Quaternionf quaternion = orientPath[inputPlane.getIteration()];
+  Eigen::Vector3f position = path[inputPlane.getIteration()];
+  plane outputPlane (quaternion * Eigen::Matrix3f::Zero(), (quaternion * inputPlane.getMean()) + position, inputPlane.getIteration());
+}
+
+#define CLOSE_PLANE_COUNT 25
+static void constrainByPlane(plane newPlaneGlobal) {
   if (!cloud.pts.empty()) {
-    Eigen::Vector3f absPoint = newPlane.getMean() + position;
-    const float query_pt[3] = {absPoint.x(), absPoint.y(), absPoint.z()};
+    Eigen::Vector3f globalMean = newPlaneGlobal.getMean();
+    const float query_pt[3] = {globalMean.x(), globalMean.y(), globalMean.z()};
     unsigned int ret_index[CLOSE_PLANE_COUNT];
     float out_dist_sqr[CLOSE_PLANE_COUNT];
     nanoflann::KNNResultSet<float> resultSet(CLOSE_PLANE_COUNT);
@@ -219,10 +248,18 @@ static void constrainByPlane(plane newPlane) {
 
     tree_index.findNeighbors(resultSet, query_pt);
     for (const auto& index : ret_index) {
-      plane pastPlane = allPlanes[index];
-      
+      plane pastPlaneGlobal = applySensorPos(allPlanes[index]);
+      if (doConstrain(pastPlaneGlobal, newPlaneGlobal)){
+
+      }
     }
   }
+}
+
+static void advanceIteration() {
+  iteration++;
+  path.push_back(position);
+  orientPath.push_back(Orientation);
 }
 
 static void runMatching() {
@@ -236,7 +273,7 @@ static void runMatching() {
     xSemaphoreGive(i2cMutex);
     return;
   }
-  iteration++;
+  advanceIteration();
   std::vector<ptWithDeviation> localCloud = interpretDistances(distData);
   int ptCount = localCloud.size();
   int n = 0;
@@ -252,7 +289,7 @@ static void runMatching() {
       allPlanes.push_back(newPlane);
       ptCount = localCloud.size();
       distributions = makeIntDistros(ptCount);
-      constrainByPlane(newPlane);
+      constrainByPlane(applySensorPos(newPlane));
     }
   }
   int endCloudSize = cloud.kdtree_get_point_count();

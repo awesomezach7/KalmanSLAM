@@ -7,7 +7,7 @@ class plane{
         ~plane();
         Eigen::Matrix3f getCov();
         Eigen::Vector3f getMean();
-        Eigen::Vector3f getNorm();
+        Eigen::Vector3f getUnitNorm();
         int getIteration();
     private:
         std::array<float, 6> covariances;
@@ -15,9 +15,9 @@ class plane{
         int iteration;
 };
 
-Eigen::Vector3f plane::getNorm() {
+Eigen::Vector3f plane::getUnitNorm() {
   Eigen::JacobiSVD<Eigen::Matrix3f> svd(getCov(), Eigen::ComputeThinU | Eigen::ComputeThinV);
-  return svd.matrixU().col(2);
+  return (svd.matrixU().col(2)).normalized();
 }
 
 Eigen::Matrix3f decompressCov(std::array<float, 6> compressed) {
